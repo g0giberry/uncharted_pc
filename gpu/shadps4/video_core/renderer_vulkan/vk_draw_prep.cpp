@@ -79,7 +79,7 @@ struct FlatArena {
         const size_t words = (count * sizeof(T) + sizeof(u32) - 1) / sizeof(u32);
         used = (used + 1) & ~size_t(1);
         if (chunks.empty() || words > ChunkWords - std::min(used, ChunkWords)) {
-            chunks.push_back(std::make_unique<u32[]>(std::max(ChunkWords, words)));
+            chunks.push_back(std::make_unique_for_overwrite<u32[]>(std::max(ChunkWords, words)));
             used = 0;
         }
         u32* dst = chunks.back().get() + used;
@@ -221,7 +221,8 @@ DrawPreparation::~DrawPreparation() {
     if (scanner.joinable()) {
         scanner.request_stop();
     }
-    cv.notify_all();
+    scan_cv.notify_all();
+    work_cv.notify_all();
     workers.clear();
     scanner = {};
 }
@@ -253,7 +254,7 @@ void DrawPreparation::Enqueue(u64 seq, std::shared_ptr<Submission> submission) {
         std::scoped_lock lk{mutex};
         submissions.push_back(std::move(submission));
     }
-    cv.notify_all();
+    scan_cv.notify_one();
 }
 
 void DrawPreparation::BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg_checksum,
@@ -272,7 +273,8 @@ void DrawPreparation::BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg
         initial_cs = tail_cs = cs;
         baseline_seq = tail_seq = seq;
         baseline_ready = true;
-        cv.notify_all();
+        scan_cv.notify_one();
+        work_cv.notify_all();
     }
     // Idle helpers can starve on a busy CPU. Rather than queueing without bound, restart
     // them from the GPU thread's own state (one register copy) once the scanner lags.
@@ -287,7 +289,7 @@ void DrawPreparation::BeginSubmission(u64 seq, const AmdGpu::Regs& regs, u64 reg
             submissions.pop_front();
         }
         ++rebases;
-        cv.notify_all();
+        scan_cv.notify_one();
     }
     if (!submissions.empty() && seq >= submissions.front()->seq &&
         seq - submissions.front()->seq < submissions.size()) {
@@ -346,7 +348,7 @@ void DrawPreparation::ScannerLoop(std::stop_token stop) {
     u64 next_seq = 0;
     {
         std::unique_lock lk{mutex};
-        cv.wait(lk, stop, [&] { return baseline_ready; });
+        scan_cv.wait(lk, stop, [&] { return baseline_ready; });
         if (stop.stop_requested()) {
             return;
         }
@@ -360,7 +362,7 @@ void DrawPreparation::ScannerLoop(std::stop_token stop) {
         std::shared_ptr<Submission> submission;
         {
             std::unique_lock lk{mutex};
-            cv.wait(lk, stop, [&] {
+            scan_cv.wait(lk, stop, [&] {
                 return next_seq < tail_seq ||
                        (!submissions.empty() && submissions.back()->seq >= next_seq);
             });
@@ -393,7 +395,13 @@ void DrawPreparation::ScannerLoop(std::stop_token stop) {
             submission->scanned.store(true, std::memory_order_release);
         }
         ++next_seq;
-        cv.notify_all();
+        if (submission->num_draws || submission->num_dispatches) {
+            if (pipeline_cache.CompilingRecently()) {
+                work_cv.notify_all();
+            } else {
+                work_cv.notify_one();
+            }
+        }
     }
 }
 
@@ -421,6 +429,7 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
         const u64 gpu = gpu_seq.load(std::memory_order_acquire);
         for (const auto& submission : submissions) {
             if (submission->seq >= gpu && submission->seq >= tail_seq &&
+                (submission->num_draws || submission->num_dispatches) &&
                 submission->scanned.load(std::memory_order_acquire) &&
                 !submission->claimed.load(std::memory_order_relaxed)) {
                 return submission;
@@ -457,7 +466,7 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
         {
             std::unique_lock lk{mutex};
             // gpu_seq moves without the lock: keep the candidate the predicate found.
-            cv.wait(lk, stop, [&] {
+            work_cv.wait(lk, stop, [&] {
                 target = baseline_ready ? claimable() : nullptr;
                 assisting = false;
                 if (!target && baseline_ready) {

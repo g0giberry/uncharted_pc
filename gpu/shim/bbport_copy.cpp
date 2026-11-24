@@ -79,20 +79,18 @@ public:
         while (true) {
             Task task;
             {
-                std::scoped_lock lk{mutex};
+                std::unique_lock lk{mutex};
+                done_cv.wait(lk, [&] {
+                    return (pending == 0 && epochs.size() == 1 && !draining) ||
+                           !async_tasks.empty();
+                });
                 if (pending == 0 && epochs.size() == 1 && !draining) {
                     return;
                 }
-                if (!async_tasks.empty()) {
-                    task = std::move(async_tasks.front());
-                    async_tasks.pop_front();
-                }
+                task = std::move(async_tasks.front());
+                async_tasks.pop_front();
             }
-            if (task.run) {
-                RunAsync(task);
-            } else {
-                std::this_thread::yield();
-            }
+            RunAsync(task);
         }
     }
 
@@ -172,6 +170,9 @@ private:
             lk.lock();
         }
         draining = false;
+        if (pending == 0 && epochs.size() == 1) {
+            done_cv.notify_all();
+        }
     }
 
     static void Work(Job& job) {
@@ -214,6 +215,7 @@ private:
     std::vector<std::thread> threads;
     std::mutex mutex;
     std::condition_variable cv;
+    std::condition_variable done_cv;
     std::shared_ptr<Job> current;
     u64 generation = 0;
     bool stop = false;
