@@ -719,6 +719,7 @@ void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
     if (!draw_pipe || !size) {
         return;
     }
+    InvalidateRingReuse();
     // Draws write the same buffers over and over: an entry for the range only moves on.
     // bbport (Mevlock, U2 chapter 1 train flash): Head() is where the packet being prepared
     // starts, and Reached(Head()) holds as soon as the packet before it has run. A write noted by
@@ -775,7 +776,7 @@ bool Rasterizer::PendingWriteOverlaps(VAddr address, u64 size) {
 
 void Rasterizer::CollectRingBindings(const Shader::Info& stage, const PreparedDraw* prepared,
                            boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>& out) {
-    if (constant_ring->Position() - ring_epoch_start >= (16ull << 20)) {
+    if (constant_ring->Position() - ring_epoch_start >= (4ull << 20)) {
         InvalidateRingReuse();
     }
     const PreparedStage* prepared_stage = nullptr;
@@ -931,14 +932,29 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
         if (stage) {
             auto& ring = rings[num_stages];
             ring.clear();
-            if (constant_ring && !BbToggle::Disabled(BbToggle::ConstantRing) &&
-                !(hle_dispatch && IsShaderHLE(stage->pgm_hash))) {
-                const u64 ring_tsc0 = BbStats::stage_a_profile ? __rdtsc() : 0;
-                CollectRingBindings(*stage, used_prepared, ring);
-                if (BbStats::stage_a_profile) {
-                    const u64 dt = __rdtsc() - ring_tsc0;
-                    BbStats::stage_a.collect_ring_cycles += dt;
-                    ring_dt_total += dt;
+            if (constant_ring && !BbToggle::Disabled(BbToggle::ConstantRing)) {
+                if (hle_dispatch && IsShaderHLE(stage->pgm_hash)) {
+                    InvalidateRingReuse();
+                    for (const auto& desc : stage->buffers) {
+                        if (desc.IsSpecial() || !desc.is_written) {
+                            continue;
+                        }
+                        const auto vsharp = desc.GetSharp(*stage);
+                        const u32 raw_size = vsharp.GetSize();
+                        if (vsharp.base_address && raw_size) {
+                            NotePendingGpuWrite(
+                                vsharp.base_address,
+                                memory->ClampRangeSize(vsharp.base_address, raw_size));
+                        }
+                    }
+                } else {
+                    const u64 ring_tsc0 = BbStats::stage_a_profile ? __rdtsc() : 0;
+                    CollectRingBindings(*stage, used_prepared, ring);
+                    if (BbStats::stage_a_profile) {
+                        const u64 dt = __rdtsc() - ring_tsc0;
+                        BbStats::stage_a.collect_ring_cycles += dt;
+                        ring_dt_total += dt;
+                    }
                 }
             }
             any_ring |= !ring.empty();
@@ -1100,6 +1116,7 @@ void Rasterizer::RetireSubmission() {
     if (!draw_pipe || !OnStageA()) {
         return;
     }
+    InvalidateRingReuse();
     draw_pipe->Publish();
     ring_batch_bytes = 0;
     while (!pipe_keepalive.empty() && draw_pipe->Reached(pipe_keepalive.front().first)) {
@@ -1110,14 +1127,13 @@ void Rasterizer::RetireSubmission() {
     }
 }
 
-bool Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, u64 toggle,
-                            bool invalidate_ring) {
+bool Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, u64 toggle) {
     if (!UseDrawPipe() || BbToggle::Disabled(toggle)) {
         DrainDrawPipe(DrawPipe::ReasonRasterizer);
         task(*this, static_cast<const u8*>(data));
         return false;
     }
-    if (invalidate_ring && OnStageA()) {
+    if (OnStageA()) {
         InvalidateRingReuse();
     }
     const u32 total = sizeof(TaskPacket) + AlignPacket(size);
@@ -2519,7 +2535,8 @@ void Rasterizer::DispatchDirect() {
     if (!pipeline) {
         return;
     }
-    if (pipelined) {
+    if (pipelined && !ShaderHLEMayWriteGuestMemory(
+                         pipeline->GetStage(Shader::SwStage::Compute), CsRegs(), *this)) {
         PostDraw(pipeline, nullptr, false, 0, &CsRegs());
         return;
     }
@@ -2924,7 +2941,7 @@ void Rasterizer::MaybeSubmitEarly() {
                 SubmitInfo info{};
                 r.scheduler.Flush(info);
             },
-            nullptr, 0, BbToggle::PipelinedTasks, false);
+            nullptr, 0);
         return;
     }
     Flush();

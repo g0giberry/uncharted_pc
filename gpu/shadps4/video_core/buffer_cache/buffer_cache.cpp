@@ -341,8 +341,13 @@ bool BufferCache::DownloadOnSideQueue(VAddr page, u64 length) {
                                     side.staging.mapped_data.data() + copy.dstOffset, copy.size);
         }
     }
+    {
+        std::scoped_lock lk{gpu_ranges_mutex};
+        for (const VAddr at : pages) {
+            gpu_modified_ranges.Subtract(at, TRACKER_BYTES_PER_PAGE);
+        }
+    }
     for (const VAddr at : pages) {
-        gpu_modified_ranges.Subtract(at, TRACKER_BYTES_PER_PAGE);
         memory_tracker->UnmarkRegionAsGpuModified(at, TRACKER_BYTES_PER_PAGE);
     }
     BbStats::gpu_side_download_ns.fetch_add(
@@ -930,7 +935,10 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
             }
             if (dead_frames && frames >= dead_frames && gpu_write <= frames - dead_frames &&
                 gpu_use <= frames - dead_frames) {
-                gpu_modified_ranges.Subtract(page, length);
+                {
+                    std::scoped_lock lk{gpu_ranges_mutex};
+                    gpu_modified_ranges.Subtract(page, length);
+                }
                 memory_tracker->UnmarkRegionAsGpuModified(page, length);
                 memory_tracker->MarkRegionAsCpuModified(device_addr, size);
                 BbStats::dead_gpu_drops.fetch_add(1, std::memory_order_relaxed);
@@ -1137,8 +1145,11 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             constexpr u64 mask = ~(align - 1ULL);
             total_size_bytes += (new_size + align - 1) & mask;
         };
-        gpu_modified_ranges.ForEachInRange(address, size, add_download);
-        gpu_modified_ranges.Subtract(address, size);
+        {
+            std::scoped_lock lk{gpu_ranges_mutex};
+            gpu_modified_ranges.ForEachInRange(address, size, add_download);
+            gpu_modified_ranges.Subtract(address, size);
+        }
     });
     if (total_size_bytes == 0) {
         return;
@@ -1499,7 +1510,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             BbStats::buffer_upload_bytes.load(std::memory_order_relaxed) - uploaded_before;
     }
     if (is_written) {
-        gpu_modified_ranges.Add(device_addr, size);
+        {
+            std::scoped_lock lk{gpu_ranges_mutex};
+            gpu_modified_ranges.Add(device_addr, size);
+        }
         obtain_memo_epoch.fetch_add(1, std::memory_order_release);
     }
     const u64 arena_offset = arena->Offset(device_addr);
@@ -1825,6 +1839,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 for (const auto& shadow : it->second) {
                     ForEachShadowRun(shadow, [&](size_t i, size_t j, bool guest_owned) {
                         if (guest_owned) {
+                            std::scoped_lock range_lk{gpu_ranges_mutex};
                             gpu_modified_ranges.Subtract(shadow.start + i, j - i);
                             return;
                         }

@@ -852,7 +852,6 @@ bool SpecMatchesCompute(const Shader::Info& info, const Shader::StageSpecializat
         }
     }
     bool any_fresh_bit = false;
-    u32 binding = 0;
     for (u32 i = 0; i < info.buffers.size(); ++i) {
         const auto& desc = info.buffers[i];
         const auto sharp = desc.GetSharp(info);
@@ -872,11 +871,10 @@ bool SpecMatchesCompute(const Shader::Info& info, const Shader::StageSpecializat
                 bs.index_stride = sharp.index_stride;
                 bs.element_size = sharp.element_size;
             }
-            if (cached.bitset[binding] && bs != cached.buffers[i]) {
+            if (bs != cached.buffers[i]) {
                 return false;
             }
         }
-        ++binding;
     }
     for (u32 i = 0; i < info.images.size(); ++i) {
         const auto& desc = info.images[i];
@@ -895,11 +893,10 @@ bool SpecMatchesCompute(const Shader::Info& info, const Shader::StageSpecializat
             }
             is.num_conversion = sharp.GetNumberConversion();
             is.num_bindings = desc.NumBindings(info);
-            if (cached.bitset[binding] && is != cached.images[i]) {
+            if (is != cached.images[i]) {
                 return false;
             }
         }
-        ++binding;
     }
     if (cached.bitset.none() && !any_fresh_bit) {
         return true;

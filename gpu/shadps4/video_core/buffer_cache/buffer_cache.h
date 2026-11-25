@@ -151,6 +151,12 @@ public:
         return gpu_modified_ranges.Intersects(addr, size);
     }
 
+    /// Thread-safe query of `gpu_modified_ranges` for Stage A heuristics.
+    [[nodiscard]] bool IsRangeGpuWrittenConcurrent(VAddr addr, size_t size) const {
+        std::scoped_lock lk{gpu_ranges_mutex};
+        return gpu_modified_ranges.Intersects(addr, size);
+    }
+
     /// bbport: writes the image that starts at `addr` (its current GPU contents, tiled as in
     /// guest memory) into the buffer of that range, before a shader copies the range as plain
     /// memory. False when no image starts there.
@@ -220,6 +226,7 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    mutable std::mutex gpu_ranges_mutex;
     std::atomic<u64> obtain_memo_epoch{1};
     /// bbport: pages the guest writes while they hold recent GPU data (InvalidateMemory): the
     /// guest bytes of their GPU-written ranges as the write began. An upload sends only the bytes

@@ -23,6 +23,12 @@ bool IsGuestMemoryShaderHLE(unsigned long long pgm_hash);
 /// True if `ExecuteShaderHLE` can handle this compute shader without binding resources.
 bool IsShaderHLE(unsigned long long pgm_hash);
 
+/// True if `ExecuteShaderHLE` for this compute dispatch may write guest memory synchronously
+/// (meaning Stage A must drain the draw pipe and run it before walking later draws' SRTs).
+bool ShaderHLEMayWriteGuestMemory(const Shader::Info& info,
+                                  const AmdGpu::ComputeProgram& cs_program,
+                                  Rasterizer& rasterizer);
+
 /// Attempts to execute a shader using HLE if possible.
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer);

@@ -406,6 +406,71 @@ bool IsShaderHLE(unsigned long long pgm_hash) {
     return pgm_hash == COPY_SHADER_HASH || IsGuestMemoryShaderHLE(pgm_hash);
 }
 
+bool ShaderHLEMayWriteGuestMemory(const Shader::Info& info,
+                                  const AmdGpu::ComputeProgram& cs_program,
+                                  Rasterizer& rasterizer) {
+    if (!IsGuestMemoryShaderHLE(info.pgm_hash)) {
+        return false;
+    }
+    if (info.buffers.size() != 2 || BbToggle::Disabled(BbToggle::MultiCopyShader)) {
+        return false;
+    }
+    const auto ud = info.UserData();
+    if (ud.size() <= 6) {
+        return false;
+    }
+    const auto src = info.buffers[0].GetSharp(info);
+    const auto dst = info.buffers[1].GetSharp(info);
+    if (src.GetStride() != 4 || dst.GetStride() != 4 || !src.base_address || !dst.base_address) {
+        return false;
+    }
+    const u64 group_size = (info.pgm_hash == SCALAR_COPY64_SHADER_HASH) ? 64 : 1;
+    const u64 count =
+        std::min<u64>({u64(cs_program.dim_x) * group_size, ud[6], src.num_records, dst.num_records});
+    if (count == 0) {
+        return false;
+    }
+    const u64 size = count * 4;
+    auto& buffer_cache = rasterizer.GetBufferCache();
+    const bool src_gpu = buffer_cache.IsRegionGpuModified(src.base_address, size);
+    const bool dst_gpu = buffer_cache.IsRegionGpuModified(dst.base_address, size);
+    if (src_gpu || dst_gpu) {
+        static const bool both = [] {
+            const char* env = std::getenv("BB_SCALAR_COPY_BOTH");
+            return !(env && env[0] == '0');
+        }();
+        static const bool sync_all = [] {
+            const char* env = std::getenv("BB_SCALAR_COPY_SYNC");
+            return env && env[0] == '1';
+        }();
+        static const bool small_sync = [] {
+            const char* env = std::getenv("BB_SCALAR_COPY_SMALL_SYNC");
+            return env && env[0] == '1';
+        }();
+        static const int sync_64 = [] {
+            const char* env = std::getenv("BB_SCALAR_COPY64_SYNC");
+            return !env ? 0 : env[0] == '0' ? 0 : env[0] == '1' ? 1 : 2;
+        }();
+        static const bool defer_64 = [] {
+            const char* env = std::getenv("BB_SCALAR_COPY64_DEFER");
+            return !(env && env[0] == '0');
+        }();
+        if (size >= 1_MB) {
+            return false;
+        }
+        if (!small_sync && !both) {
+            return false;
+        }
+        if (!small_sync && !sync_all && src_gpu &&
+            buffer_cache.IsRangeGpuWrittenConcurrent(src.base_address, size)) {
+            if (group_size == 1 || sync_64 == 0 || (sync_64 == 2 && defer_64)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
     switch (info.pgm_hash) {
