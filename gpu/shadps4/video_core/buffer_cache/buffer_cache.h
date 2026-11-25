@@ -95,6 +95,10 @@ public:
     /// memory again (regions the GPU did not write).
     void ForceUpload(VAddr device_addr, u64 size);
 
+    /// bbport: re-stamps an already GPU-modified range with the current GPU write tick after a
+    /// mid-BindResources flush.
+    void RestampGpuWritten(VAddr device_addr, u64 size);
+
     /// bbport: a guest write fault at `device_addr` was handled; unprotect its neighbourhood.
     void ExtendWriteFault(VAddr device_addr);
 
@@ -213,6 +217,7 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    std::atomic<u64> obtain_memo_epoch{1};
     /// bbport: pages the guest writes while they hold recent GPU data (InvalidateMemory): the
     /// guest bytes of their GPU-written ranges as the write began. An upload sends only the bytes
     /// the guest changed since (the rest keeps the GPU's data); a read-back keeps those bytes.
@@ -248,7 +253,7 @@ private:
     std::atomic<u32> gate_outstanding{0}; ///< labels queued or running on the landing thread
     std::thread landing_thread;
     void LandingWorker();
-    bool ExecuteLanding(Landing& landing);
+    bool ExecuteLandingBatch(std::span<const std::shared_ptr<Landing>> batch);
     bool WaitLandingTick(u64 tick);
     std::atomic<bool> landing_exited{false};
 

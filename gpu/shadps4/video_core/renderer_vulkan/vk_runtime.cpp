@@ -759,13 +759,16 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
+    if (!has_tracked_writes && (!check_read_access || !has_tracked_reads)) {
+        return false;
+    }
     const AddressRange range = {
         .resource = reinterpret_cast<u64>(handle),
         .range_start = offset,
         .range_end = offset + size - 1,
     };
-    bool has_access = barrier_tracker.FindRange(range, Access::Write);
-    if (check_read_access && !has_access) {
+    bool has_access = has_tracked_writes && barrier_tracker.FindRange(range, Access::Write);
+    if (check_read_access && !has_access && has_tracked_reads) {
         has_access |= barrier_tracker.FindRange(range, Access::Read);
     }
     return has_access;
@@ -817,9 +820,11 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         memo = {range.resource, range.range_start, range.range_end, access_epoch, u32(access)};
     };
     if (src_access & WRITE_MASK) {
+        has_tracked_writes = true;
         insert(Access::Write);
     }
     if (src_access & READ_MASK) {
+        has_tracked_reads = true;
         insert(Access::Read);
     }
 
@@ -862,6 +867,8 @@ void Runtime::FlushBarriers() {
 
     image_barriers.clear();
     barrier_tracker.Clear();
+    has_tracked_writes = false;
+    has_tracked_reads = false;
     ++access_epoch;
 }
 

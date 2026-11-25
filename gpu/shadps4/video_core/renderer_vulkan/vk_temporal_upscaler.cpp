@@ -1596,27 +1596,14 @@ void TemporalUpscaler::PrepareUiDepth(VideoCore::ImageId depth_id) {
                         vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
         runtime.FlushBarriers();
     }
-    const auto cmd = scheduler.CommandBuffer();
     const vk::ImageSubresourceRange range{aspect, 0, 1, 0, 1};
-    vk::ImageMemoryBarrier2 barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .oldLayout = vk::ImageLayout::eUndefined,
-        .newLayout = vk::ImageLayout::eTransferDstOptimal,
-        .image = vk::Image(ui_depth_image), .subresourceRange = range,
-    };
-    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
-    cmd.clearDepthStencilImage(vk::Image(ui_depth_image), vk::ImageLayout::eTransferDstOptimal,
-                               {.depth = 1.0f, .stencil = 0}, range);
+    const vk::Image dst_img = vk::Image(ui_depth_image);
+    vk::Image src_img{};
+    vk::ImageBlit region{};
     if (copy) {
-        barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
-        barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-        barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
-        cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
         const auto& source = texture_cache.GetImage(depth_id);
-        const vk::ImageBlit region{
+        src_img = vk::Image(source.backing->image);
+        region = {
             .srcSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
             .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
                 vk::Offset3D{s32(source.info.size.width), s32(source.info.size.height), 1}},
@@ -1624,21 +1611,41 @@ void TemporalUpscaler::PrepareUiDepth(VideoCore::ImageId depth_id) {
             .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
                 vk::Offset3D{s32(ui_width), s32(ui_height), 1}},
         };
-        cmd.blitImage(vk::Image(source.backing->image), vk::ImageLayout::eTransferSrcOptimal,
-                      vk::Image(ui_depth_image), vk::ImageLayout::eTransferDstOptimal,
-                      region, vk::Filter::eNearest);
     }
-    // Without blit support, UI depth is cleared but not copied from the scene.
-    // UI elements will still depth-test correctly against the cleared buffer.
-    barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
-    barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-    barrier.dstStageMask = vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                           vk::PipelineStageFlagBits2::eLateFragmentTests;
-    barrier.dstAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-                            vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
-    barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
-    barrier.newLayout = vk::ImageLayout::eGeneral;
-    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+    scheduler.Record([range, dst_img, copy, src_img, region](vk::CommandBuffer cmd) {
+        vk::ImageMemoryBarrier2 barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .image = dst_img, .subresourceRange = range,
+        };
+        cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+        cmd.clearDepthStencilImage(dst_img, vk::ImageLayout::eTransferDstOptimal,
+                                   {.depth = 1.0f, .stencil = 0}, range);
+        if (copy) {
+            barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+            barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+            barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+            cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+            cmd.blitImage(src_img, vk::ImageLayout::eTransferSrcOptimal,
+                          dst_img, vk::ImageLayout::eTransferDstOptimal,
+                          region, vk::Filter::eNearest);
+        }
+        // Without blit support, UI depth is cleared but not copied from the scene.
+        // UI elements will still depth-test correctly against the cleared buffer.
+        barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+        barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+        barrier.dstStageMask = vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                               vk::PipelineStageFlagBits2::eLateFragmentTests;
+        barrier.dstAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+        barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+        barrier.newLayout = vk::ImageLayout::eGeneral;
+        cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+    });
 }
 
 void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId depth_id) {
@@ -1671,18 +1678,7 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
                         vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
         runtime.FlushBarriers();
     }
-    const auto cmd = scheduler.CommandBuffer();
-    vk::ImageMemoryBarrier2 barrier{
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .oldLayout = vk::ImageLayout::eUndefined,
-        .newLayout = vk::ImageLayout::eTransferDstOptimal,
-        .image = vk::Image(ui_image),
-        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-    };
-    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+    const vk::Image dst_img = vk::Image(ui_image);
     const vk::ImageBlit region{
         .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
         .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
@@ -1691,17 +1687,30 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
         .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
             vk::Offset3D{s32(ui_width), s32(ui_height), 1}},
     };
-    cmd.blitImage(source, source_layout,
-                  vk::Image(ui_image), vk::ImageLayout::eTransferDstOptimal, region,
-                  vk::Filter::eLinear);
-    barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
-    barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
-    barrier.dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
-    barrier.dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
-                            vk::AccessFlagBits2::eColorAttachmentWrite;
-    barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
-    barrier.newLayout = vk::ImageLayout::eGeneral;
-    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+    scheduler.Record([dst_img, source, source_layout, region](vk::CommandBuffer cmd) {
+        vk::ImageMemoryBarrier2 barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .image = dst_img,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        };
+        cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+        cmd.blitImage(source, source_layout,
+                      dst_img, vk::ImageLayout::eTransferDstOptimal, region,
+                      vk::Filter::eLinear);
+        barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+        barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+        barrier.dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+        barrier.dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+                                vk::AccessFlagBits2::eColorAttachmentWrite;
+        barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+        barrier.newLayout = vk::ImageLayout::eGeneral;
+        cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+    });
     reset = true; // returning to 3D must not reuse history from before a menu/loading screen
     done_this_frame = ui_phase = true;
     ui_color = color_id;

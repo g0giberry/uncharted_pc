@@ -24,53 +24,77 @@ Pipeline::~Pipeline() = default;
 
 
 void Pipeline::BindResources(DescriptorWrites& set_writes,
-                             const Shader::PushData& push_data) const {
+                             const Shader::PushData& push_data,
+                             std::span<const vk::DescriptorBufferInfo> buffer_infos,
+                             std::span<const vk::DescriptorImageInfo> image_infos) const {
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
     const vk::PipelineLayout layout = *pipeline_layout;
-    scheduler.Record([layout, stage_flags, push_data](vk::CommandBuffer cmdbuf) {
-        cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);
-    });
 
     // Bind descriptor set.
     if (set_writes.empty()) {
+        scheduler.Record([layout, stage_flags, push_data](vk::CommandBuffer cmdbuf) {
+            cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);
+        });
         return;
     }
 
     if (uses_push_descriptors) {
         if (!scheduler.IsRecordingDeferred()) {
             scheduler.Record([&](vk::CommandBuffer cmdbuf) {
+                cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);
                 cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, set_writes);
             });
             return;
         }
         // Writes and the infos they point to are laid out in the recording chunk, with the
         // pointers already aimed at those copies: the command only carries a span.
-        size_t bytes = set_writes.size() * sizeof(vk::WriteDescriptorSet) + 64;
-        for (const auto& write : set_writes) {
-            bytes += write.descriptorCount *
-                         (sizeof(vk::DescriptorBufferInfo) + sizeof(vk::DescriptorImageInfo) +
-                          sizeof(vk::BufferView)) +
-                     32;
+        size_t bytes = set_writes.size() * sizeof(vk::WriteDescriptorSet) +
+                       buffer_infos.size_bytes() + image_infos.size_bytes() + 64;
+        if (buffer_infos.empty() || image_infos.empty()) {
+            for (const auto& write : set_writes) {
+                if ((write.pBufferInfo && buffer_infos.empty()) ||
+                    (write.pImageInfo && image_infos.empty()) || write.pTexelBufferView) {
+                    bytes += write.descriptorCount *
+                                 (sizeof(vk::DescriptorBufferInfo) + sizeof(vk::DescriptorImageInfo) +
+                                  sizeof(vk::BufferView)) +
+                             32;
+                }
+            }
         }
         scheduler.ReserveRecordData(bytes);
         const auto writes = scheduler.RecordData(std::span<const vk::WriteDescriptorSet>{set_writes});
+        const auto dst_bufs = scheduler.RecordData(buffer_infos);
+        const auto dst_imgs = scheduler.RecordData(image_infos);
         auto* patched = const_cast<vk::WriteDescriptorSet*>(writes.data());
+        const auto* src_buf_base = buffer_infos.data();
+        const auto* src_img_base = image_infos.data();
         for (size_t i = 0; i < writes.size(); ++i) {
             auto& write = patched[i];
             if (write.pBufferInfo) {
-                write.pBufferInfo = scheduler.RecordData(std::span{write.pBufferInfo, write.descriptorCount}).data();
+                if (!buffer_infos.empty()) {
+                    write.pBufferInfo = dst_bufs.data() + (write.pBufferInfo - src_buf_base);
+                } else {
+                    write.pBufferInfo =
+                        scheduler.RecordData(std::span{write.pBufferInfo, write.descriptorCount}).data();
+                }
             }
             if (write.pImageInfo) {
-                write.pImageInfo = scheduler.RecordData(std::span{write.pImageInfo, write.descriptorCount}).data();
+                if (!image_infos.empty()) {
+                    write.pImageInfo = dst_imgs.data() + (write.pImageInfo - src_img_base);
+                } else {
+                    write.pImageInfo =
+                        scheduler.RecordData(std::span{write.pImageInfo, write.descriptorCount}).data();
+                }
             }
             if (write.pTexelBufferView) {
                 write.pTexelBufferView =
                     scheduler.RecordData(std::span{write.pTexelBufferView, write.descriptorCount}).data();
             }
         }
-        scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
+        scheduler.Record([bind_point, layout, stage_flags, push_data, writes](vk::CommandBuffer cmdbuf) {
+            cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);
             cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
         });
         return;
@@ -82,7 +106,8 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
         set_write.dstSet = desc_set;
     }
     instance.GetDevice().updateDescriptorSets(set_writes, {});
-    scheduler.Record([bind_point, layout, desc_set](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([bind_point, layout, stage_flags, push_data, desc_set](vk::CommandBuffer cmdbuf) {
+        cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);
         cmdbuf.bindDescriptorSets(bind_point, layout, 0, desc_set, {});
     });
 }

@@ -193,13 +193,13 @@ void Liverpool::Process(std::stop_token stoken) {
             }
         }
 
-        if (submit_done) {
+        const bool was_submit_done = submit_done.exchange(false);
+        if (was_submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
                 rasterizer->OnSubmit();
                 rasterizer->Flush();
             }
-            submit_done = false;
         }
 
         // bbport: the guest takes GPU idle (sceGnmSubmitDone) as its work being done and frees
@@ -209,17 +209,23 @@ void Liverpool::Process(std::stop_token stoken) {
         // heap free list after minutes of play).
         // The same holds when sceGnmSubmitDone finds the GPU idle and does not block at all:
         // decoded (num_submits 0) is not done until then (work_retired).
-        if (rasterizer) {
-            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
-            rasterizer->WaitDeferredSignals();
-        }
-        {
-            std::scoped_lock lk{submit_mutex};
-            if (num_submits == 0) {
-                work_retired = true;
+        // Only retire and signal GpuIdle at actual sceGnmSubmitDone() boundaries (was_submit_done):
+        // mid-frame batches keep work_retired=false so sceGnmSubmitDone() still sets
+        // submission_lock and waits for retirement, while avoiding stalling Stage A on LandingGate
+        // 3x/frame between mid-frame command buffers.
+        if (was_submit_done) {
+            if (rasterizer) {
+                rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
+                rasterizer->WaitDeferredSignals();
             }
+            {
+                std::scoped_lock lk{submit_mutex};
+                if (num_submits == 0 && !submit_done) {
+                    work_retired = true;
+                }
+            }
+            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
         }
-        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
 }
 
@@ -398,6 +404,24 @@ void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
 void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto* header = reinterpret_cast<const PM4Header*>(data);
     const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(data);
+    const u32 data_size = (header->type3.count.Value() - 2) * sizeof(u32);
+    if (data_size <= sizeof(u64) && Vulkan::DrawPipe::OnStageB() &&
+        !BbToggle::Disabled(BbToggle::RecorderFences)) {
+        const u64 landing_seq = VideoCore::LandingGate::Pending();
+        rasterizer.GetBufferCache().CheckStableBindings();
+        rasterizer.CheckConstants();
+        u64 value = 0;
+        std::memcpy(&value, write_data->data, data_size);
+        auto* addr = write_data->Address<void*>();
+        rasterizer.SignalAfterHostCopies(
+            [addr, value, data_size] {
+                BbWriteLog::Note(reinterpret_cast<u64>(addr), &value, data_size,
+                                 BbWriteLog::WriteData);
+                std::memcpy(addr, &value, data_size);
+            },
+            landing_seq);
+        return;
+    }
     // Copies deferred to the recording thread, and fences deferred to it (RecorderFences),
     // precede writes the guest sees.
     rasterizer.WaitHostCopies();
@@ -405,10 +429,9 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     VideoCore::LandingGate::Wait(VideoCore::LandingGate::Pending());
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
-    BbWriteLog::Note(write_data->Address<u64>(), write_data->data,
-                     (header->type3.count.Value() - 2) * sizeof(u32), BbWriteLog::WriteData);
-    std::memcpy(write_data->Address<u64*>(), write_data->data,
-                (header->type3.count.Value() - 2) * sizeof(u32));
+    BbWriteLog::Note(write_data->Address<u64>(), write_data->data, data_size,
+                     BbWriteLog::WriteData);
+    std::memcpy(write_data->Address<u64*>(), write_data->data, data_size);
 }
 
 void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
@@ -416,12 +439,11 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     // Raycaster copies deferred before this packet land before its label shows (landing_gate.h).
     const u64 landing_seq = VideoCore::LandingGate::Pending();
     // Copies deferred to the recording thread precede writes the guest sees.
-    const bool chained = VideoCore::LandingGate::Active() &&
-                         event_eos.command != PM4CmdEventWriteEos::Command::GdsStore &&
+    const bool chained = event_eos.command != PM4CmdEventWriteEos::Command::GdsStore &&
                          Vulkan::DrawPipe::OnStageB() &&
                          !BbToggle::Disabled(BbToggle::RecorderFences);
-    rasterizer.WaitHostCopies();
     if (!chained) {
+        rasterizer.WaitHostCopies();
         rasterizer.WaitDeferredSignals();
     }
     rasterizer.ProcessDownloadImages();
@@ -449,6 +471,48 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
         const u32 value = rasterizer.ReadDataFromGds(event_eos.gds_index);
         *event_eos.Address() = value;
     }
+}
+
+struct ReleaseMemPacket {
+    PM4CmdReleaseMem release_mem;
+    u32 pipe_id;
+};
+
+void RunReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    const auto packet = *reinterpret_cast<const ReleaseMemPacket*>(data);
+    const auto& release_mem = packet.release_mem;
+    const u64 landing_seq = VideoCore::LandingGate::Pending();
+    const bool chained = release_mem.data_sel.Value() != DataSelect::GdsMemStore &&
+                         Vulkan::DrawPipe::OnStageB() &&
+                         !BbToggle::Disabled(BbToggle::RecorderFences);
+    if (!chained) {
+        rasterizer.WaitHostCopies();
+        rasterizer.WaitDeferredSignals();
+    }
+    rasterizer.GetBufferCache().CheckStableBindings();
+    rasterizer.CheckConstants();
+    rasterizer.ProcessDownloadImages();
+    if (chained) {
+        rasterizer.SignalAfterHostCopies(
+            [release_mem, pipe_id = packet.pipe_id] {
+                release_mem.SignalFence(
+                    [pipe_id] {
+                        Platform::IrqC::Instance()->Signal(
+                            static_cast<Platform::InterruptId>(pipe_id));
+                    },
+                    [](VAddr, u16, u16) { UNREACHABLE(); });
+            },
+            landing_seq);
+        return;
+    }
+    VideoCore::LandingGate::Wait(landing_seq);
+    release_mem.SignalFence(
+        [pipe_id = packet.pipe_id] {
+            Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+        },
+        [&rasterizer](VAddr dst, u16 gds_index, u16 num_dwords) {
+            rasterizer.CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
+        });
 }
 } // namespace
 
@@ -1344,6 +1408,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    if (wait_reg_mem->Test(regs.reg_array)) {
+                        break;
+                    }
                     if (rasterizer) {
                         rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                     }
@@ -1481,9 +1548,6 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
         ProcessCommands();
-        if (rasterizer) {
-            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute); // bbport: compute work uses the caches
-        }
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
         u32 next_dw_off = header->type3.NumWords() + 1;
@@ -1617,6 +1681,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             } else {
                 std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                             header + 2, set_size);
+                pipe_dirty.Mark(Regs::ShRegWordOffset + set_data->reg_offset,
+                                header->type3.NumWords() - 1);
                 // bbport: interleaves with the graphics stream at an unpredictable point, so
                 // draw-preparation workers cannot reproduce it: make their checksums differ.
                 gfx_reg_checksum = HashRegisterPacket(gfx_reg_checksum ^ 0xA5C0A5C0A5C0ull,
@@ -1677,20 +1743,21 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::WriteData: {
-            // bbport: copies deferred to the recording thread precede writes the guest sees, and
-            // so do graphics fences deferred to it (the pipe was drained before this packet).
-            if (rasterizer) {
-                rasterizer->WaitHostCopies();
-                rasterizer->WaitDeferredSignals();
-                VideoCore::LandingGate::Wait(VideoCore::LandingGate::Pending());
-            }
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
-            const u32 data_size = (header->type3.count.Value() - 2) * 4;
-            if (!write_data->wr_one_addr.Value()) {
-                std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+            const u32 count = header->type3.count.Value();
+            const u32 data_size = (count - 2) * 4;
+            ASSERT(!write_data->wr_one_addr.Value());
+            if (rasterizer) {
+                BbWriteLog::NoteIntent(write_data->Address<u64>(), write_data->data, data_size,
+                                       BbWriteLog::WriteDataIntent);
+                if (rasterizer->RunInOrder(&RunWriteData, header, (count + 1) * sizeof(u32),
+                                           BbToggle::PipelinedMemoryWrites)) {
+                    NotePendingWrite(*write_data, data_size);
+                    rasterizer->NotePendingGpuWrite(write_data->Address<VAddr>(), data_size);
+                }
             } else {
-                UNREACHABLE();
+                std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
             }
             break;
         }
@@ -1710,31 +1777,34 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                if (rasterizer && !rasterizer->DrawPipeIdle()) {
+                    rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+                    continue;
+                }
                 YIELD_ASC(vqid);
             }
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
-            // bbport: copies deferred to the recording thread precede writes the guest sees, and
-            // so do graphics fences deferred to it (the pipe was drained before this packet).
-            if (rasterizer) {
-                rasterizer->WaitHostCopies();
-                rasterizer->WaitDeferredSignals();
-                VideoCore::LandingGate::Wait(VideoCore::LandingGate::Pending());
-                rasterizer->GetBufferCache().CheckStableBindings();
-                rasterizer->CheckConstants();
-            }
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
+            const ReleaseMemPacket packet{*release_mem, queue.pipe_id};
             if (rasterizer) {
-                rasterizer->ProcessDownloadImages();
+                if (rasterizer->RunInOrder(&RunReleaseMem, &packet, sizeof(packet)) &&
+                    (release_mem->data_sel.Value() == DataSelect::Data32Low ||
+                     release_mem->data_sel.Value() == DataSelect::Data64)) {
+                    rasterizer->NotePendingGpuWrite(
+                        release_mem->Address<VAddr>(),
+                        release_mem->data_sel.Value() == DataSelect::Data64 ? sizeof(u64)
+                                                                           : sizeof(u32));
+                }
+            } else {
+                release_mem->SignalFence(
+                    [pipe_id = queue.pipe_id] {
+                        Platform::IrqC::Instance()->Signal(
+                            static_cast<Platform::InterruptId>(pipe_id));
+                    },
+                    [](VAddr, u16, u16) {});
             }
-            release_mem->SignalFence(
-                [pipe_id = queue.pipe_id] {
-                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
-                },
-                [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                    rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
-                });
             break;
         }
         case PM4ItOpcode::EventWrite: {

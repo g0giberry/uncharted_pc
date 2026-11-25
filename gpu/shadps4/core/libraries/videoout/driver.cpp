@@ -468,6 +468,7 @@ void VideoOutDriver::Flip(const Request& req) {
                         BbStats::tick_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
+            BbStats::PrintHostCopyWaits(window);
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
             if (intervals.size() > 2) {
                 std::vector<double> sorted = intervals;
@@ -607,10 +608,12 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
         liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
-    } else if (Vulkan::Scheduler::OnRecorderThread()) {
-        // bbport: the end-of-pipe label of this flip was signalled by the Vulkan recording
-        // thread (RecorderFences). PrepareFrame there waits in SyncRecording for that thread to
-        // go idle, i.e. for itself: the game froze (U1 jeep chase). The GPU thread makes it.
+    } else if (!AmdGpu::Liverpool::OnProcessorThread()) {
+        // bbport: end-of-pipe flips may fire from the Vulkan recording thread (RecorderFences),
+        // the landing thread (LandingGate::Post), or stage B. PrepareFrame touches texture_cache,
+        // runtime, and draw_scheduler directly, so any non-processor thread must marshal it onto
+        // Liverpool (ProcessCommands drains the draw pipe first) to avoid deadlocking
+        // SyncRecording or racing draw_scheduler with stage B.
         liverpool->SendCommand([=, this]() {
             SubmitFlipInternal(port, index, flip_arg, is_eop);
             eop_flip_reached();

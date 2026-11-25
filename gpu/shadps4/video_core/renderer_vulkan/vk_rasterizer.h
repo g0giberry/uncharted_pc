@@ -91,9 +91,10 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     /// GPU thread, before a write the guest can observe (see Scheduler::WaitHostCopies).
-    void WaitHostCopies() {
-        DrainDrawPipe();
-        scheduler.WaitHostCopies();
+    void WaitHostCopies(u32 line = __builtin_LINE(),
+                        const char* function = __builtin_FUNCTION()) {
+        DrainDrawPipe(DrawPipe::ReasonRasterizer, line, function);
+        scheduler.WaitHostCopies(line, function);
     }
 
     /// bbport: GPU command thread: waits until the draw recording thread has recorded every
@@ -139,8 +140,9 @@ public:
     bool NoteCopy64Readback(const Shader::Info& stage);
     void ReadBackSmallWrittenBuffers();
     /// Before a guest-visible write: fences deferred earlier are written first.
-    void WaitDeferredSignals() {
-        scheduler.WaitDeferredSignals();
+    void WaitDeferredSignals(u32 line = __builtin_LINE(),
+                             const char* function = __builtin_FUNCTION()) {
+        scheduler.WaitDeferredSignals(line, function);
     }
     /// Runs `signal` after the guest memory copies issued so far, without waiting here.
     void SignalAfterHostCopies(std::function<void()> signal, u64 landing_seq = 0,
@@ -216,6 +218,7 @@ private:
         bool operator==(const BeginSignature&) const = default;
     };
     BeginSignature MakeBeginSignature(const GraphicsPipeline* pipeline) const;
+    bool MatchesBeginSignature(const GraphicsPipeline* pipeline, const BeginSignature& sig);
     struct BeginMemo {
         bool valid = false;
         BeginSignature signature;
@@ -223,13 +226,23 @@ private:
         u32 scene_size = 0;
         std::array<float, 2> target_scale{};
         u64 meta_clears = 0; ///< TextureCache::MetaClears when stored
+        // bbport: target register snapshot to skip FindTargetMemoized in PrepareRenderState on hit.
+        u32 color_control_raw = 0;
+        u32 color_target_mask_raw = 0;
+        bool depth_enabled = false;
+        VAddr htile_address = 0;
+        AmdGpu::DepthBuffer depth_buffer{};
+        AmdGpu::DepthView depth_view{};
+        AmdGpu::CbDbExtent db_hint{};
+        std::array<AmdGpu::ColorBuffer, AmdGpu::NUM_COLOR_BUFFERS> color_buffers{};
+        std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_hints{};
     } begin_memo;
     u64 begin_memo_hits = 0, begin_memo_misses = 0;
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
 
-    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
+    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed);
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
@@ -298,14 +311,28 @@ private:
         const Shader::Info* stage = nullptr;
         u64 generation = ~0ull;
         u64 scene_generation = 0; ///< SceneTargets::Generation of the proxy views
+        u64 last_use = 0;
         u32 count = 0;
         static constexpr u32 MaxImages = 16; ///< larger sets are not memoized
         std::array<u64, MaxImages> hashes{};
         std::array<TextureSetEntry, MaxImages> entries{};
     };
     std::array<TextureSet, 32768> texture_sets{};
+    u64 texture_set_use = 0;
     u64 texture_set_hits = 0, texture_set_misses = 0;
     std::array<u64, 4> texture_set_why{}; ///< misses: other key, generation, image check, new
+    struct SamplerSet {
+        u64 key = 0;
+        const Shader::Info* stage = nullptr;
+        u64 tick = ~0ull;
+        u64 bc_base = 0;
+        u32 bias_bits = 0;
+        u32 count = 0;
+        static constexpr u32 MaxSamplers = 16;
+        std::array<AmdGpu::Sampler, MaxSamplers> sharps{};
+        std::array<vk::Sampler, MaxSamplers> handles{};
+    };
+    std::array<SamplerSet, 4096> sampler_sets{};
     /// Returns true when the stage's images were bound from the memo.
     bool BindTexturesFromSet(const Shader::Info& stage, const PreparedStage* prepared,
                              u32 first_image_idx, bool& barrier, TextureSet*& slot);
@@ -335,6 +362,8 @@ private:
     void EmitVertexBuffers();
     void ResolveIndexBuffer(u32 index_offset);
     void EmitIndexBuffer();
+    void EmitDraw(vk::Pipeline handle, bool is_indexed, u32 num_indices, u32 num_instances,
+                  u32 first_vertex, u32 first_instance, const void* checkpoint);
 
     void ResetBindings(bool is_compute);
 
@@ -470,6 +499,24 @@ private:
         u64 offset;
         vk::IndexType type;
     } index_bind{};
+    struct EmitCache {
+        u64 generation = ~0ull;
+        vk::Pipeline gfx_pipeline{};
+        IndexBind index_bind{};
+        bool index_valid = false;
+        bool vi_valid = false;
+        VertexInputs<vk::VertexInputBindingDescription2EXT> vi_bindings;
+        VertexInputs<vk::VertexInputAttributeDescription2EXT> vi_attributes;
+    } emit_cache{};
+    bool pipe_dyn_dirty = true;
+    struct DynStateCache {
+        u64 generation = ~0ull;
+        bool is_indexed = false;
+        bool feedback_loop = false;
+        std::array<float, 2> target_scale{0.0f, 0.0f};
+        std::array<float, 2> draw_jitter{0.0f, 0.0f};
+        ColorWriteMasks write_masks{};
+    } dyn_state_cache{};
     /// The direct draw whose vertex/index buffers BindResources may resolve early.
     struct DrawInputs {
         const GraphicsPipeline* pipeline;
@@ -554,6 +601,9 @@ private:
     std::deque<std::pair<u64, std::shared_ptr<const void>>> pipe_keepalive;
     std::unique_ptr<DrawPipe> draw_pipe;
     u32 draws_since_submit = 0;
+    u32 draws_this_frame = 0;
+    u32 last_frame_draws = 0;
+    u32 flushes_this_frame = 0;
     std::chrono::steady_clock::time_point last_submit{};
 };
 

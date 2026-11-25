@@ -74,7 +74,8 @@ struct BufferCache::SideQueue {
 
     SideQueue(const Vulkan::Instance& instance, vk::Queue queue_)
         : device{instance.GetDevice()}, queue{queue_},
-          staging{instance, 0, StagingSize, MemoryType::HostCached, "Side queue download"} {
+          staging{instance, 0, StagingSize, MemoryType::HostCached, "Side queue download"},
+          landing_staging{instance, 0, StagingSize, MemoryType::HostCached, "Side queue landing"} {
         pool = Vulkan::Check(device.createCommandPoolUnique({
             .flags = vk::CommandPoolCreateFlagBits::eTransient,
             .queueFamilyIndex = instance.GetSideQueueFamilyIndex(),
@@ -86,6 +87,18 @@ struct BufferCache::SideQueue {
                                }))
                      .front();
         fence = Vulkan::Check(device.createFenceUnique({}));
+
+        landing_pool = Vulkan::Check(device.createCommandPoolUnique({
+            .flags = vk::CommandPoolCreateFlagBits::eTransient,
+            .queueFamilyIndex = instance.GetSideQueueFamilyIndex(),
+        }));
+        landing_cmdbuf = Vulkan::Check(device.allocateCommandBuffers({
+                                           .commandPool = *landing_pool,
+                                           .level = vk::CommandBufferLevel::ePrimary,
+                                           .commandBufferCount = 1,
+                                       }))
+                             .front();
+        landing_fence = Vulkan::Check(device.createFenceUnique({}));
     }
 
     vk::Device device;
@@ -94,7 +107,15 @@ struct BufferCache::SideQueue {
     vk::UniqueCommandPool pool;
     vk::CommandBuffer cmdbuf;
     vk::UniqueFence fence;
-    std::mutex mutex;
+    std::mutex mutex; ///< guards staging/pool/cmdbuf/fence for DownloadOnSideQueue
+
+    // Dedicated context for bb:Landing so it never contends with DownloadOnSideQueue
+    // during waitForFences / staging invalidation / TryWriteBacking.
+    Buffer landing_staging;
+    vk::UniqueCommandPool landing_pool;
+    vk::CommandBuffer landing_cmdbuf;
+    vk::UniqueFence landing_fence;
+    std::mutex queue_mutex; ///< guards only queue.submit (Vulkan external sync on VkQueue)
 };
 
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -174,7 +195,13 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     // before the command lands, in the next one.
     static Vulkan::Scheduler* write_scheduler;
     write_scheduler = &scheduler;
-    g_gpu_write_done_tick = [] { return write_scheduler->CurrentTick() + 1; };
+    static const bool exact_write_tick = [] {
+        const char* env = std::getenv("BB_EXACT_WRITE_TICK");
+        return !(env && env[0] == '0');
+    }();
+    g_gpu_write_done_tick = [] {
+        return write_scheduler->CurrentTick() + (exact_write_tick ? 0 : 1);
+    };
     land_stopping.store(false, std::memory_order_release);
     land_instance.store(this, std::memory_order_release);
     const char* side_env = std::getenv("BB_SIDE_DOWNLOAD");
@@ -302,7 +329,10 @@ bool BufferCache::DownloadOnSideQueue(VAddr page, u64 length) {
             .commandBufferCount = 1,
             .pCommandBuffers = &side.cmdbuf,
         };
-        Vulkan::Check(side.queue.submit(submit, *side.fence));
+        {
+            std::scoped_lock qlk{side.queue_mutex};
+            Vulkan::Check(side.queue.submit(submit, *side.fence));
+        }
         Vulkan::Check(side.device.waitForFences(*side.fence, true, UINT64_MAX));
         Vulkan::Check(side.device.resetFences(*side.fence));
         side.staging.Invalidate(0, total);
@@ -384,6 +414,7 @@ bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size, bool guest_part
         return false; // page flags and written ranges disagree: nothing says when it lands
     }
     landing->tick = tick;
+
     // The guest part of the copy now; the GPU-written bytes follow when they have landed.
     if (guest_part) {
         memory->TryWriteBacking(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), size);
@@ -397,7 +428,7 @@ bool BufferCache::DeferGuestCopy(VAddr src, VAddr dst, u64 size, bool guest_part
             landing->seq = ++landing_registered_seq;
             landing_registered.store(landing->seq, std::memory_order_release);
         } else {
-            landing->seq = landing_registered_seq; // no label waits for it
+            landing->seq = landing_registered_seq; // labels do not wait for ungated copies
         }
         landing_queue.push_back(std::move(landing));
         if (!landing_thread.joinable()) {
@@ -452,75 +483,120 @@ bool BufferCache::WaitLandingTick(u64 tick) {
     return false;
 }
 
-bool BufferCache::ExecuteLanding(Landing& landing) {
+bool BufferCache::ExecuteLandingBatch(std::span<const std::shared_ptr<Landing>> batch) {
     auto& side = *side_queue;
-    if (!WaitLandingTick(landing.tick)) {
-        return false;
-    }
+    u64 max_tick = 0;
     u64 total = 0;
-    for (const auto& copy : landing.copies) {
-        total = std::max(total, copy.dstOffset + copy.size);
+    struct RebasedCopy {
+        VAddr target;
+        u64 dst_offset;
+        u64 size;
+    };
+    boost::container::small_vector<RebasedCopy, 16> outputs;
+
+    Vulkan::Check(side.device.resetCommandPool(*side.landing_pool));
+    Vulkan::Check(
+        side.landing_cmdbuf.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}));
+
+    boost::container::small_vector<vk::BufferCopy, 16> grouped_copies;
+    vk::Buffer current_buf{};
+    const auto flush_grouped = [&] {
+        if (!grouped_copies.empty()) {
+            side.landing_cmdbuf.copyBuffer(current_buf, side.landing_staging.Handle(),
+                                           grouped_copies);
+            grouped_copies.clear();
+        }
+    };
+
+    for (const auto& landing : batch) {
+        max_tick = std::max(max_tick, landing->tick);
+        if (landing->buffer != current_buf) {
+            flush_grouped();
+            current_buf = landing->buffer;
+        }
+        for (size_t i = 0; i < landing->copies.size(); ++i) {
+            total = Common::AlignUp(total, 64);
+            vk::BufferCopy c = landing->copies[i];
+            c.dstOffset = total;
+            grouped_copies.push_back(c);
+            outputs.push_back({landing->targets[i], total, c.size});
+            total += c.size;
+        }
     }
+    flush_grouped();
+
+    const vk::MemoryBarrier2 to_host = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    side.landing_cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_host});
+    Vulkan::Check(side.landing_cmdbuf.end());
+
+    // Submit directly with a hardware timeline semaphore wait on max_tick (already submitted by
+    // DeferGuestCopy's scheduler.Flush()): eliminates the CPU WaitLandingTick wakeup + WDDM
+    // submit gap between graphics completion and DMA start.
+    const vk::Semaphore timeline = scheduler.GetWorkSemaphore()->Handle();
+    const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
+    const vk::TimelineSemaphoreSubmitInfo timeline_info = {
+        .waitSemaphoreValueCount = 1,
+        .pWaitSemaphoreValues = &max_tick,
+    };
+    const vk::SubmitInfo submit = {
+        .pNext = &timeline_info,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &timeline,
+        .pWaitDstStageMask = &wait_stage,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &side.landing_cmdbuf,
+    };
     {
-        std::scoped_lock lk{side.mutex};
-        Vulkan::Check(side.device.resetCommandPool(*side.pool));
-        Vulkan::Check(side.cmdbuf.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}));
-        side.cmdbuf.copyBuffer(landing.buffer, side.staging.Handle(), landing.copies);
-        const vk::MemoryBarrier2 to_host = {
-            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
-            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
-        };
-        side.cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_host});
-        Vulkan::Check(side.cmdbuf.end());
-        const vk::Semaphore timeline = scheduler.GetWorkSemaphore()->Handle();
-        const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
-        const u64 wait_value = landing.tick;
-        const vk::TimelineSemaphoreSubmitInfo timeline_info = {
-            .waitSemaphoreValueCount = 1,
-            .pWaitSemaphoreValues = &wait_value,
-        };
-        const vk::SubmitInfo submit = {
-            .pNext = &timeline_info,
-            .waitSemaphoreCount = 1,
-            .pWaitSemaphores = &timeline,
-            .pWaitDstStageMask = &wait_stage,
-            .commandBufferCount = 1,
-            .pCommandBuffers = &side.cmdbuf,
-        };
-        Vulkan::Check(side.queue.submit(submit, *side.fence));
-        // The tick has been reached, so the copy is short. In slices anyway: at shutdown it gets
-        // half a second more.
-        u32 slices_after_stop = 0;
-        for (;;) {
-            const vk::Result result = side.device.waitForFences(*side.fence, true, 20'000'000ull);
-            if (result == vk::Result::eSuccess) {
-                break;
-            }
-            if (result == vk::Result::eErrorDeviceLost) {
-                Vulkan::DeviceLost(side.device);
-            }
-            if (result != vk::Result::eTimeout) {
-                Vulkan::Check(result);
-            }
-            if (land_stopping.load(std::memory_order_acquire) && ++slices_after_stop > 25) {
-                return false;
-            }
+        std::scoped_lock qlk{side.queue_mutex};
+        Vulkan::Check(side.queue.submit(submit, *side.landing_fence));
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    bool reported = false;
+    u32 slices_after_stop = 0;
+    for (;;) {
+        const vk::Result result =
+            side.device.waitForFences(*side.landing_fence, true, 20'000'000ull);
+        if (result == vk::Result::eSuccess) {
+            break;
         }
-        Vulkan::Check(side.device.resetFences(*side.fence));
-        side.staging.Invalidate(0, total);
-        for (size_t i = 0; i < landing.copies.size(); ++i) {
-            memory->TryWriteBacking(reinterpret_cast<void*>(landing.targets[i]),
-                                    side.staging.mapped_data.data() + landing.copies[i].dstOffset,
-                                    landing.copies[i].size);
+        if (result == vk::Result::eErrorDeviceLost) {
+            Vulkan::DeviceLost(side.device);
         }
+        if (result != vk::Result::eTimeout) {
+            Vulkan::Check(result);
+        }
+        if (land_stopping.load(std::memory_order_acquire) && ++slices_after_stop > 25) {
+            return false;
+        }
+        if (!reported && std::chrono::steady_clock::now() - begin > std::chrono::seconds(5)) {
+            reported = true;
+            std::printf("GPU stall: the landing thread waits 5 s for tick %llu\n",
+                        static_cast<unsigned long long>(max_tick));
+        }
+    }
+    Vulkan::Check(side.device.resetFences(*side.landing_fence));
+    side.landing_staging.Invalidate(0, total);
+    for (const auto& out : outputs) {
+        memory->TryWriteBacking(reinterpret_cast<void*>(out.target),
+                                side.landing_staging.mapped_data.data() + out.dst_offset,
+                                out.size);
     }
     return true;
 }
 
 void BufferCache::LandingWorker() {
     Common::SetCurrentThreadName("bb:Landing");
+    static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
+    auto& work_sem = *scheduler.GetWorkSemaphore();
+    boost::container::small_vector<std::shared_ptr<Landing>, 16> batch;
+    u64 stat_copies = 0, stat_batches = 0, stat_wait_tick_ns = 0, stat_dma_ns = 0;
+    auto stat_window = std::chrono::steady_clock::now();
+
     std::unique_lock lk{landing_mutex};
     for (;;) {
         landing_cv.wait(lk, [&] {
@@ -541,18 +617,75 @@ void BufferCache::LandingWorker() {
             gate_outstanding.fetch_sub(1, std::memory_order_release);
             continue;
         }
-        const auto landing = std::move(landing_queue.front());
+        batch.clear();
+        auto landing_bytes = [](const Landing& l) {
+            u64 b = 0;
+            for (const auto& c : l.copies) {
+                b = Common::AlignUp(b, 64) + c.size;
+            }
+            return b;
+        };
+        auto first = std::move(landing_queue.front());
         landing_queue.pop_front();
+        const u64 first_tick = first->tick;
+        u64 batch_bytes = landing_bytes(*first);
+        u64 batch_max_seq = first->seq;
+        batch.push_back(std::move(first));
         lk.unlock();
+
+        // Wait on the GPU timeline BEFORE touching side.queue so we never submit an
+        // unsatisfied timeline wait that head-of-line blocks DownloadOnSideQueue.
+        const auto t_wait0 = std::chrono::steady_clock::now();
+        WaitLandingTick(first_tick);
+        const auto t_wait1 = std::chrono::steady_clock::now();
+        work_sem.Refresh();
+
+        // Greedily coalesce any already-completed queued landings that fit in staging.
+        lk.lock();
+        while (!landing_queue.empty()) {
+            const auto& next = *landing_queue.front();
+            const u64 next_bytes = landing_bytes(next);
+            if (Common::AlignUp(batch_bytes, 64) + next_bytes > SideQueue::StagingSize) {
+                break;
+            }
+            if (!work_sem.IsFree(next.tick)) {
+                break;
+            }
+            batch_bytes = Common::AlignUp(batch_bytes, 64) + next_bytes;
+            batch_max_seq = std::max(batch_max_seq, next.seq);
+            batch.push_back(std::move(landing_queue.front()));
+            landing_queue.pop_front();
+        }
+        lk.unlock();
+
         // Lands without data when cancelled at shutdown or when the wait for the GPU failed:
         // the labels behind it go on either way.
-        ExecuteLanding(*landing);
+        const auto t_dma0 = std::chrono::steady_clock::now();
+        ExecuteLandingBatch(batch);
+        const auto t_dma1 = std::chrono::steady_clock::now();
+
+        if (stats) {
+            stat_copies += batch.size();
+            ++stat_batches;
+            stat_wait_tick_ns += static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t_wait1 - t_wait0).count());
+            stat_dma_ns += static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t_dma1 - t_dma0).count());
+            if (t_dma1 - stat_window >= std::chrono::seconds(5)) {
+                std::printf("Landing: %llu copies in %llu batches, wait_tick %.1f ms, dma %.1f ms\n",
+                            static_cast<unsigned long long>(stat_copies),
+                            static_cast<unsigned long long>(stat_batches), stat_wait_tick_ns / 1e6,
+                            stat_dma_ns / 1e6);
+                stat_copies = stat_batches = stat_wait_tick_ns = stat_dma_ns = 0;
+                stat_window = t_dma1;
+            }
+        }
+
         lk.lock();
-        landing_done_seq = landing->seq;
-        landing_done.store(landing->seq, std::memory_order_release);
+        landing_done_seq = std::max(landing_done_seq, batch_max_seq);
+        landing_done.store(landing_done_seq, std::memory_order_release);
         landing_done_cv.notify_all();
     }
-    // Shutdown: what is still pending is dropped, nobody waits for it any more.
     landing_queue.clear();
     gated_labels.clear();
     gate_outstanding.store(0, std::memory_order_release);
@@ -697,6 +830,12 @@ void BufferCache::ForceUpload(VAddr device_addr, u64 size) {
     }
 }
 
+void BufferCache::RestampGpuWritten(VAddr device_addr, u64 size) {
+    if (size) {
+        memory_tracker->MarkRegionAsGpuModified(device_addr, size);
+    }
+}
+
 namespace {
 /// bbport: the guest frame (g_guest_frames) in which the GPU last bound each 4 KiB page of the
 /// GPU heap window, read or written (BufferCache::ObtainBuffer). GPU data still in use, such as
@@ -755,6 +894,7 @@ u32 LastGpuUse(VAddr address, u64 size) {
 } // namespace
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
+    obtain_memo_epoch.fetch_add(1, std::memory_order_release);
     memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
         // bbport: a guest write to a page holding GPU data read that data back first, which
         // waits for the whole GPU queue (U3's Cartagena square: ~70 times a second, 5-20 ms each,
@@ -1240,6 +1380,38 @@ void BufferCache::CheckStableBindings() {
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
     const bool stats = BufferStatsEnabled();
+    struct ObtainMemo {
+        const BufferCache* owner;
+        VAddr address;
+        u32 size;
+        u32 frame;
+        u64 tick;
+        u64 epoch;
+        const Buffer* buffer;
+        u64 offset;
+    };
+    static thread_local std::array<ObtainMemo, 4096> obtain_memo{};
+    ObtainMemo* memo_slot = nullptr;
+    u64 memo_tick = 0;
+    u64 memo_epoch = 0;
+    u32 memo_frame = 0;
+    if (!is_written && !is_texel_buffer && !stats && !StableCheckEnabled() &&
+        !ClobberCheckEnabled() && !BbToggle::Disabled(BbToggle::StreamCopyReuse)) {
+        memo_tick = scheduler.CurrentTick();
+        memo_epoch = obtain_memo_epoch.load(std::memory_order_acquire);
+        memo_frame = g_guest_frames.load(std::memory_order_relaxed);
+        memo_slot =
+            &obtain_memo[((device_addr >> 4) ^ (device_addr >> 17) ^ size) % obtain_memo.size()];
+        if (memo_slot->owner == this && memo_slot->tick == memo_tick &&
+            memo_slot->epoch == memo_epoch && memo_slot->address == device_addr &&
+            memo_slot->size == size) {
+            if (memo_slot->frame != memo_frame) {
+                NoteGpuUse(device_addr, size);
+                memo_slot->frame = memo_frame;
+            }
+            return {memo_slot->buffer, memo_slot->offset};
+        }
+    }
     if (stats) {
         PrintBufferStats();
         NoteHotUse(device_addr, size);
@@ -1295,6 +1467,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                     .size = size,
                     .extra = reinterpret_cast<u64>(static_cast<Buffer*>(&stream_buffer)),
                 });
+                if (memo_slot) {
+                    *memo_slot = {this,       device_addr, size,           memo_frame,
+                                  memo_tick, memo_epoch,  &stream_buffer, *offset};
+                }
                 return {&stream_buffer, *offset};
             }
         }
@@ -1324,8 +1500,13 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
+        obtain_memo_epoch.fetch_add(1, std::memory_order_release);
     }
-    return {arena, arena->Offset(device_addr)};
+    const u64 arena_offset = arena->Offset(device_addr);
+    if (memo_slot) {
+        *memo_slot = {this, device_addr, size, memo_frame, memo_tick, memo_epoch, arena, arena_offset};
+    }
+    return {arena, arena_offset};
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
@@ -1373,6 +1554,7 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
+    obtain_memo_epoch.fetch_add(1, std::memory_order_release);
     for (const auto& range : resident_ranges) {
         const u64 page = range.start >> (arena_page_bits - block_shift);
         const VAddr device_addr = range.start << block_shift;

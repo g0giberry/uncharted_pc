@@ -130,6 +130,8 @@ private:
     };
     std::array<AccessMemo, 512> access_memo{};
     u32 access_epoch = 1;
+    bool has_tracked_writes = false;
+    bool has_tracked_reads = false;
 };
 
 } // namespace Vulkan

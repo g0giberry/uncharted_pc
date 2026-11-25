@@ -58,7 +58,9 @@ public:
     }
 
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
-    void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
+    void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data,
+                       std::span<const vk::DescriptorBufferInfo> buffer_infos = {},
+                       std::span<const vk::DescriptorImageInfo> image_infos = {}) const;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;

@@ -26,6 +26,69 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "bbport_threads.h"
 
+namespace BbStats {
+namespace {
+struct WaitSiteKey {
+    const char* kind;
+    const char* fn;
+    std::uint32_t line;
+    bool operator==(const WaitSiteKey& o) const = default;
+};
+struct WaitSiteHash {
+    std::size_t operator()(const WaitSiteKey& k) const noexcept {
+        return std::hash<const void*>{}(k.kind) ^ (std::hash<const void*>{}(k.fn) << 1) ^
+               (std::hash<std::uint32_t>{}(k.line) << 2);
+    }
+};
+struct WaitSiteAcc {
+    std::uint64_t ns{0};
+    std::uint64_t calls{0};
+};
+std::mutex wait_sites_mutex;
+std::unordered_map<WaitSiteKey, WaitSiteAcc, WaitSiteHash> wait_sites;
+} // namespace
+
+void NoteHostCopyWait(const char* kind, const char* fn, std::uint32_t line, std::uint64_t ns) {
+    static const bool enabled = std::getenv("BB_FRAME_STATS") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    std::scoped_lock lk{wait_sites_mutex};
+    auto& acc = wait_sites[{kind, fn, line}];
+    acc.ns += ns;
+    ++acc.calls;
+}
+
+void PrintHostCopyWaits(double window_s) {
+    std::unordered_map<WaitSiteKey, WaitSiteAcc, WaitSiteHash> snap;
+    {
+        std::scoped_lock lk{wait_sites_mutex};
+        if (wait_sites.empty()) {
+            return;
+        }
+        snap.swap(wait_sites);
+    }
+    struct Entry {
+        WaitSiteKey key;
+        WaitSiteAcc acc;
+    };
+    std::vector<Entry> entries;
+    entries.reserve(snap.size());
+    for (const auto& [k, v] : snap) {
+        entries.push_back({k, v});
+    }
+    std::ranges::sort(entries, [](const Entry& a, const Entry& b) { return a.acc.ns > b.acc.ns; });
+    std::printf("  host copy/signal waits:");
+    for (size_t i = 0; i < std::min<size_t>(entries.size(), 8); ++i) {
+        const auto& e = entries[i];
+        const double pct = window_s > 0 ? e.acc.ns / (window_s * 1e7) : 0.0;
+        std::printf(" %s:%s:%u=%.1f%%(%llu)", e.key.kind, e.key.fn ? e.key.fn : "?", e.key.line,
+                    pct, static_cast<unsigned long long>(e.acc.calls));
+    }
+    std::printf("\n");
+}
+} // namespace BbStats
+
 namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
@@ -277,12 +340,14 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal, u64 landing_
     KickRecording(true);
 }
 
-void Scheduler::WaitDeferredSignals() {
+void Scheduler::WaitDeferredSignals(u32 line, const char* function) {
     const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
     if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||
         BbToggle::Disabled(BbToggle::OrderedGuestWrites)) {
         return;
     }
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool gate_active = VideoCore::LandingGate::Active();
     BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
@@ -293,16 +358,25 @@ void Scheduler::WaitDeferredSignals() {
         BbCopy::WaitAsync();
         std::this_thread::yield();
     }
+    const u64 ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+            .count());
+    BbStats::NoteHostCopyWait(gate_active ? "SignalGate" : "SignalRec", function, line, ns);
 }
 
-void Scheduler::WaitHostCopies() {
+void Scheduler::WaitHostCopies(u32 line, const char* function) {
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
+        const auto t0 = std::chrono::steady_clock::now();
         BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
         KickRecording(true);
         while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
             std::this_thread::yield();
         }
+        const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - t0)
+                                            .count());
+        BbStats::NoteHostCopyWait("HostCopy", function, line, ns);
     }
     BbStats::WaitTimer timer{BbStats::copy_threads_wait_ns};
     BbCopy::WaitAsync();

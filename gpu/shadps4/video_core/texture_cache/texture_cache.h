@@ -206,6 +206,10 @@ public:
                                          AmdGpu::BorderColorBuffer border_color_base,
                                          bool is_depth, float extra_lod_bias = 0.0f);
 
+    [[nodiscard]] u64 GcTick() const noexcept {
+        return gc_tick;
+    }
+
     /// Retrieves the image with the specified id.
     Image* TryGetImage(ImageId id, u64 uid) {
         if (!slot_images.is_allocated(id)) return nullptr;
@@ -216,6 +220,10 @@ public:
         auto& image = slot_images[id];
         TouchImage(image);
         return image;
+    }
+
+    [[nodiscard]] Image& GetImageNoTouch(ImageId id) noexcept {
+        return slot_images[id];
     }
 
     /// Retrieves the image view with the specified id.
@@ -264,6 +272,9 @@ public:
     /// old contents. The memo holds only while this is unchanged.
     [[nodiscard]] u64 MetaClears() const noexcept {
         return meta_clears.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool NoSurfaceMetas() const noexcept {
+        return surface_metas.empty();
     }
     /// Returns meta type if the specified address is a metadata surface.
     std::optional<MetaType> IsMeta(VAddr address) const {

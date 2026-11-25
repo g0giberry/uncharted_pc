@@ -201,48 +201,51 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
     state.color_attachments[0].is_clear = true;
     scheduler.BeginRendering(state);
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    const vk::DescriptorImageInfo image_info = {
-        .sampler = VK_NULL_HANDLE,
-        .imageView = src_view,
-        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-    };
-    const vk::WriteDescriptorSet texture_write = {
-        .dstSet = VK_NULL_HANDLE,
-        .dstBinding = 0U,
-        .dstArrayElement = 0U,
-        .descriptorCount = 1U,
-        .descriptorType = vk::DescriptorType::eSampledImage,
-        .pImageInfo = &image_info,
-    };
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
-                                texture_write);
-
     const MsPipelineKey key{num_samples, pixel_format, src_msaa};
     auto it = std::ranges::find(ms_image_copy_pl, key, &MsPipeline::first);
     if (it == ms_image_copy_pl.end()) {
         CreateMsCopyPipeline(key);
         it = --ms_image_copy_pl.end();
     }
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *it->second);
+    const vk::PipelineLayout layout = *single_texture_pl_layout;
+    const vk::Pipeline pl = *it->second;
+    const u32 w = state.width;
+    const u32 h = state.height;
+    scheduler.Record([src_view, layout, pl, w, h](vk::CommandBuffer cmdbuf) {
+        const vk::DescriptorImageInfo image_info = {
+            .sampler = VK_NULL_HANDLE,
+            .imageView = src_view,
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        };
+        const vk::WriteDescriptorSet texture_write = {
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 0U,
+            .dstArrayElement = 0U,
+            .descriptorCount = 1U,
+            .descriptorType = vk::DescriptorType::eSampledImage,
+            .pImageInfo = &image_info,
+        };
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, layout, 0U, texture_write);
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pl);
 
-    const vk::Viewport viewport = {
-        .x = 0,
-        .y = 0,
-        .width = float(state.width),
-        .height = float(state.height),
-        .minDepth = 0.f,
-        .maxDepth = 1.f,
-    };
-    cmdbuf.setViewportWithCount(viewport);
+        const vk::Viewport viewport = {
+            .x = 0,
+            .y = 0,
+            .width = float(w),
+            .height = float(h),
+            .minDepth = 0.f,
+            .maxDepth = 1.f,
+        };
+        cmdbuf.setViewportWithCount(viewport);
 
-    const vk::Rect2D scissor = {
-        .offset = {0, 0},
-        .extent = {state.width, state.height},
-    };
-    cmdbuf.setScissorWithCount(scissor);
+        const vk::Rect2D scissor = {
+            .offset = {0, 0},
+            .extent = {w, h},
+        };
+        cmdbuf.setScissorWithCount(scissor);
 
-    cmdbuf.draw(3, 1, 0, 0);
+        cmdbuf.draw(3, 1, 0, 0);
+    });
 
     scheduler.EndRendering();
     scheduler.GetDynamicState().Invalidate();

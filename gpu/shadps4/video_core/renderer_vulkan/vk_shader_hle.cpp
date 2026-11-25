@@ -394,6 +394,10 @@ bool IsGuestMemoryShaderHLE(unsigned long long pgm_hash) {
     return pgm_hash == SCALAR_COPY_SHADER_HASH || pgm_hash == SCALAR_COPY64_SHADER_HASH;
 }
 
+bool IsShaderHLE(unsigned long long pgm_hash) {
+    return pgm_hash == COPY_SHADER_HASH || IsGuestMemoryShaderHLE(pgm_hash);
+}
+
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
     switch (info.pgm_hash) {

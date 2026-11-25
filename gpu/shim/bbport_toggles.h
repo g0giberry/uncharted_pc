@@ -158,4 +158,6 @@ inline std::atomic<std::uint64_t> gpu_signal_faults{0};
 /// Protection changes: calls and pages, those removing write access (TLB shootdowns) apart.
 inline std::atomic<std::uint64_t> protect_calls{0}, protect_pages{0}, protect_revoke_calls{0},
     protect_revoke_pages{0};
+void NoteHostCopyWait(const char* kind, const char* fn, std::uint32_t line, std::uint64_t ns);
+void PrintHostCopyWaits(double window_s);
 } // namespace BbStats

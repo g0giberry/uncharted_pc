@@ -175,6 +175,11 @@ struct DynamicState {
     ColorWriteMasks color_write_masks{};
     float line_width{};
     bool feedback_loop_enabled{};
+    u64 generation = 0;
+
+    u64 Generation() const {
+        return generation;
+    }
 
     /// Commits the dynamic state to the provided command buffer (a null one only clears the
     /// flags that committing clears).
@@ -347,6 +352,359 @@ struct DynamicState {
         }
     }
 
+    /// bbport: batches all dirty dynamic state updates into at most one scheduler.Record()
+    /// closure per draw instead of one closure per dirty flag.
+    template <typename Sched>
+    void CommitBatched(Sched& scheduler, bool depth_bounds_supported,
+                       bool color_write_mask_supported, bool feedback_loop_supported) {
+        enum DirtyBit : u32 {
+            BitViewports = 1u << 0,
+            BitScissors = 1u << 1,
+            BitDepthTest = 1u << 2,
+            BitDepthWrite = 1u << 3,
+            BitDepthCompare = 1u << 4,
+            BitDepthBoundsEnable = 1u << 5,
+            BitDepthBounds = 1u << 6,
+            BitDepthBiasEnable = 1u << 7,
+            BitDepthBias = 1u << 8,
+            BitStencilTest = 1u << 9,
+            BitStencilFrontOps = 1u << 10,
+            BitStencilBackOps = 1u << 11,
+            BitStencilBothOps = 1u << 12,
+            BitStencilFrontRef = 1u << 13,
+            BitStencilBackRef = 1u << 14,
+            BitStencilBothRef = 1u << 15,
+            BitStencilFrontWrite = 1u << 16,
+            BitStencilBackWrite = 1u << 17,
+            BitStencilBothWrite = 1u << 18,
+            BitStencilFrontCmp = 1u << 19,
+            BitStencilBackCmp = 1u << 20,
+            BitStencilBothCmp = 1u << 21,
+            BitPrimRestart = 1u << 22,
+            BitRastDiscard = 1u << 23,
+            BitCullMode = 1u << 24,
+            BitFrontFace = 1u << 25,
+            BitBlendConst = 1u << 26,
+            BitColorWriteMask = 1u << 27,
+            BitLineWidth = 1u << 28,
+            BitFeedbackLoop = 1u << 29,
+        };
+        u32 mask = 0;
+        if (dirty_state.viewports) {
+            dirty_state.viewports = false;
+            mask |= BitViewports;
+        }
+        if (dirty_state.scissors) {
+            dirty_state.scissors = false;
+            mask |= BitScissors;
+        }
+        if (dirty_state.depth_test_enabled) {
+            dirty_state.depth_test_enabled = false;
+            mask |= BitDepthTest;
+        }
+        if (dirty_state.depth_write_enabled) {
+            dirty_state.depth_write_enabled = false;
+            mask |= BitDepthWrite;
+        }
+        if (depth_test_enabled && dirty_state.depth_compare_op) {
+            dirty_state.depth_compare_op = false;
+            mask |= BitDepthCompare;
+        }
+        if (dirty_state.depth_bounds_test_enabled) {
+            dirty_state.depth_bounds_test_enabled = false;
+            if (depth_bounds_supported) {
+                mask |= BitDepthBoundsEnable;
+            }
+        }
+        if (depth_bounds_test_enabled && dirty_state.depth_bounds) {
+            dirty_state.depth_bounds = false;
+            if (depth_bounds_supported) {
+                mask |= BitDepthBounds;
+            }
+        }
+        if (dirty_state.depth_bias_enabled) {
+            dirty_state.depth_bias_enabled = false;
+            mask |= BitDepthBiasEnable;
+        }
+        if (depth_bias_enabled && dirty_state.depth_bias) {
+            dirty_state.depth_bias = false;
+            mask |= BitDepthBias;
+        }
+        if (dirty_state.stencil_test_enabled) {
+            dirty_state.stencil_test_enabled = false;
+            mask |= BitStencilTest;
+        }
+        if (stencil_test_enabled) {
+            if (dirty_state.stencil_front_ops && dirty_state.stencil_back_ops &&
+                stencil_front_ops == stencil_back_ops) {
+                mask |= BitStencilBothOps;
+            } else {
+                if (dirty_state.stencil_front_ops) {
+                    mask |= BitStencilFrontOps;
+                }
+                if (dirty_state.stencil_back_ops) {
+                    mask |= BitStencilBackOps;
+                }
+            }
+            dirty_state.stencil_front_ops = dirty_state.stencil_back_ops = false;
+
+            if (dirty_state.stencil_front_reference && dirty_state.stencil_back_reference &&
+                stencil_front_reference == stencil_back_reference) {
+                mask |= BitStencilBothRef;
+            } else {
+                if (dirty_state.stencil_front_reference) {
+                    mask |= BitStencilFrontRef;
+                }
+                if (dirty_state.stencil_back_reference) {
+                    mask |= BitStencilBackRef;
+                }
+            }
+            dirty_state.stencil_front_reference = dirty_state.stencil_back_reference = false;
+
+            if (dirty_state.stencil_front_write_mask && dirty_state.stencil_back_write_mask &&
+                stencil_front_write_mask == stencil_back_write_mask) {
+                mask |= BitStencilBothWrite;
+            } else {
+                if (dirty_state.stencil_front_write_mask) {
+                    mask |= BitStencilFrontWrite;
+                }
+                if (dirty_state.stencil_back_write_mask) {
+                    mask |= BitStencilBackWrite;
+                }
+            }
+            dirty_state.stencil_front_write_mask = dirty_state.stencil_back_write_mask = false;
+
+            if (dirty_state.stencil_front_compare_mask && dirty_state.stencil_back_compare_mask &&
+                stencil_front_compare_mask == stencil_back_compare_mask) {
+                mask |= BitStencilBothCmp;
+            } else {
+                if (dirty_state.stencil_front_compare_mask) {
+                    mask |= BitStencilFrontCmp;
+                }
+                if (dirty_state.stencil_back_compare_mask) {
+                    mask |= BitStencilBackCmp;
+                }
+            }
+            dirty_state.stencil_front_compare_mask = dirty_state.stencil_back_compare_mask = false;
+        }
+        if (dirty_state.primitive_restart_enable) {
+            dirty_state.primitive_restart_enable = false;
+            mask |= BitPrimRestart;
+        }
+        if (dirty_state.rasterizer_discard_enable) {
+            dirty_state.rasterizer_discard_enable = false;
+            mask |= BitRastDiscard;
+        }
+        if (dirty_state.cull_mode) {
+            dirty_state.cull_mode = false;
+            mask |= BitCullMode;
+        }
+        if (dirty_state.front_face) {
+            dirty_state.front_face = false;
+            mask |= BitFrontFace;
+        }
+        if (dirty_state.blend_constants) {
+            dirty_state.blend_constants = false;
+            mask |= BitBlendConst;
+        }
+        if (dirty_state.color_write_masks) {
+            dirty_state.color_write_masks = false;
+            if (color_write_mask_supported) {
+                mask |= BitColorWriteMask;
+            }
+        }
+        if (dirty_state.line_width) {
+            dirty_state.line_width = false;
+            mask |= BitLineWidth;
+        }
+        if (dirty_state.feedback_loop_enabled && feedback_loop_supported) {
+            dirty_state.feedback_loop_enabled = false;
+            mask |= BitFeedbackLoop;
+        }
+        if (mask == 0) {
+            return;
+        }
+        std::span<const vk::Viewport> vp_span;
+        std::span<const vk::Rect2D> sc_span;
+        if (mask & (BitViewports | BitScissors)) {
+            const size_t bytes =
+                ((mask & BitViewports) ? viewports.size() * sizeof(vk::Viewport) : 0) +
+                ((mask & BitScissors) ? scissors.size() * sizeof(vk::Rect2D) : 0);
+            scheduler.ReserveRecordData(bytes + 256);
+            if (mask & BitViewports) {
+                vp_span = scheduler.RecordData(
+                    std::span<const vk::Viewport>{viewports.data(), viewports.size()});
+            }
+            if (mask & BitScissors) {
+                sc_span = scheduler.RecordData(
+                    std::span<const vk::Rect2D>{scissors.data(), scissors.size()});
+            }
+        }
+        struct Scalars {
+            bool depth_test_enabled;
+            bool depth_write_enabled;
+            bool depth_bounds_test_enabled;
+            bool depth_bias_enabled;
+            bool stencil_test_enabled;
+            bool primitive_restart_enable;
+            bool rasterizer_discard_enable;
+            bool feedback_loop_enabled;
+            vk::CompareOp depth_compare_op;
+            float depth_bounds_min;
+            float depth_bounds_max;
+            float depth_bias_constant;
+            float depth_bias_clamp;
+            float depth_bias_slope;
+            StencilOps stencil_front_ops;
+            StencilOps stencil_back_ops;
+            u32 stencil_front_reference;
+            u32 stencil_back_reference;
+            u32 stencil_front_write_mask;
+            u32 stencil_back_write_mask;
+            u32 stencil_front_compare_mask;
+            u32 stencil_back_compare_mask;
+            vk::CullModeFlags cull_mode;
+            vk::FrontFace front_face;
+            std::array<float, 4> blend_constants;
+            ColorWriteMasks color_write_masks;
+            float line_width;
+        };
+        const Scalars s{
+            depth_test_enabled,
+            depth_write_enabled,
+            depth_bounds_test_enabled,
+            depth_bias_enabled,
+            stencil_test_enabled,
+            primitive_restart_enable,
+            rasterizer_discard_enable,
+            feedback_loop_enabled,
+            depth_compare_op,
+            depth_bounds_min,
+            depth_bounds_max,
+            depth_bias_constant,
+            depth_bias_clamp,
+            depth_bias_slope,
+            stencil_front_ops,
+            stencil_back_ops,
+            stencil_front_reference,
+            stencil_back_reference,
+            stencil_front_write_mask,
+            stencil_back_write_mask,
+            stencil_front_compare_mask,
+            stencil_back_compare_mask,
+            cull_mode,
+            front_face,
+            blend_constants,
+            color_write_masks,
+            line_width,
+        };
+        scheduler.Record([mask, vp_span, sc_span, s](vk::CommandBuffer c) {
+            using Face = vk::StencilFaceFlagBits;
+            if (mask & BitViewports) {
+                c.setViewportWithCount(vp_span);
+            }
+            if (mask & BitScissors) {
+                c.setScissorWithCount(sc_span);
+            }
+            if (mask & BitDepthTest) {
+                c.setDepthTestEnable(s.depth_test_enabled);
+            }
+            if (mask & BitDepthWrite) {
+                c.setDepthWriteEnable(s.depth_write_enabled);
+            }
+            if (mask & BitDepthCompare) {
+                c.setDepthCompareOp(s.depth_compare_op);
+            }
+            if (mask & BitDepthBoundsEnable) {
+                c.setDepthBoundsTestEnable(s.depth_bounds_test_enabled);
+            }
+            if (mask & BitDepthBounds) {
+                c.setDepthBounds(s.depth_bounds_min, s.depth_bounds_max);
+            }
+            if (mask & BitDepthBiasEnable) {
+                c.setDepthBiasEnable(s.depth_bias_enabled);
+            }
+            if (mask & BitDepthBias) {
+                c.setDepthBias(s.depth_bias_constant, s.depth_bias_clamp, s.depth_bias_slope);
+            }
+            if (mask & BitStencilTest) {
+                c.setStencilTestEnable(s.stencil_test_enabled);
+            }
+            if (mask & BitStencilBothOps) {
+                c.setStencilOp(Face::eFrontAndBack, s.stencil_front_ops.fail_op,
+                               s.stencil_front_ops.pass_op, s.stencil_front_ops.depth_fail_op,
+                               s.stencil_front_ops.compare_op);
+            } else {
+                if (mask & BitStencilFrontOps) {
+                    c.setStencilOp(Face::eFront, s.stencil_front_ops.fail_op,
+                                   s.stencil_front_ops.pass_op, s.stencil_front_ops.depth_fail_op,
+                                   s.stencil_front_ops.compare_op);
+                }
+                if (mask & BitStencilBackOps) {
+                    c.setStencilOp(Face::eBack, s.stencil_back_ops.fail_op,
+                                   s.stencil_back_ops.pass_op, s.stencil_back_ops.depth_fail_op,
+                                   s.stencil_back_ops.compare_op);
+                }
+            }
+            if (mask & BitStencilBothRef) {
+                c.setStencilReference(Face::eFrontAndBack, s.stencil_front_reference);
+            } else {
+                if (mask & BitStencilFrontRef) {
+                    c.setStencilReference(Face::eFront, s.stencil_front_reference);
+                }
+                if (mask & BitStencilBackRef) {
+                    c.setStencilReference(Face::eBack, s.stencil_back_reference);
+                }
+            }
+            if (mask & BitStencilBothWrite) {
+                c.setStencilWriteMask(Face::eFrontAndBack, s.stencil_front_write_mask);
+            } else {
+                if (mask & BitStencilFrontWrite) {
+                    c.setStencilWriteMask(Face::eFront, s.stencil_front_write_mask);
+                }
+                if (mask & BitStencilBackWrite) {
+                    c.setStencilWriteMask(Face::eBack, s.stencil_back_write_mask);
+                }
+            }
+            if (mask & BitStencilBothCmp) {
+                c.setStencilCompareMask(Face::eFrontAndBack, s.stencil_front_compare_mask);
+            } else {
+                if (mask & BitStencilFrontCmp) {
+                    c.setStencilCompareMask(Face::eFront, s.stencil_front_compare_mask);
+                }
+                if (mask & BitStencilBackCmp) {
+                    c.setStencilCompareMask(Face::eBack, s.stencil_back_compare_mask);
+                }
+            }
+            if (mask & BitPrimRestart) {
+                c.setPrimitiveRestartEnable(s.primitive_restart_enable);
+            }
+            if (mask & BitRastDiscard) {
+                c.setRasterizerDiscardEnable(s.rasterizer_discard_enable);
+            }
+            if (mask & BitCullMode) {
+                c.setCullMode(s.cull_mode);
+            }
+            if (mask & BitFrontFace) {
+                c.setFrontFace(s.front_face);
+            }
+            if (mask & BitBlendConst) {
+                c.setBlendConstants(s.blend_constants.data());
+            }
+            if (mask & BitColorWriteMask) {
+                c.setColorWriteMaskEXT(0, s.color_write_masks);
+            }
+            if (mask & BitLineWidth) {
+                c.setLineWidth(s.line_width);
+            }
+            if (mask & BitFeedbackLoop) {
+                c.setAttachmentFeedbackLoopEnableEXT(s.feedback_loop_enabled
+                                                         ? vk::ImageAspectFlagBits::eColor
+                                                         : vk::ImageAspectFlagBits::eNone);
+            }
+        });
+    }
+
     /// bbport: true when Commit() would record anything. Flags that Commit() defers (their
     /// test is disabled) do not count.
     [[nodiscard]] bool AnyDirty() const noexcept {
@@ -372,6 +730,7 @@ struct DynamicState {
 
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
+        ++generation;
         // bbport: named flags only; padding bits set by a memset made AnyDirty() always true.
         dirty_state.viewports = true;
         dirty_state.scissors = true;
@@ -624,8 +983,7 @@ public:
     void Execute(vk::CommandBuffer cmdbuf) {
         for (CommandBase* command = first; command;) {
             CommandBase* const next = command->next;
-            command->Execute(cmdbuf);
-            command->~CommandBase();
+            command->execute(command, cmdbuf);
             command = next;
         }
         first = last = nullptr;
@@ -653,16 +1011,20 @@ private:
     }
 
     struct CommandBase {
-        virtual ~CommandBase() = default;
-        virtual void Execute(vk::CommandBuffer cmdbuf) = 0;
+        using ExecFn = void (*)(CommandBase*, vk::CommandBuffer);
+        ExecFn execute;
         CommandBase* next{};
     };
     template <typename Func>
     struct TypedCommand final : CommandBase {
-        explicit TypedCommand(Func&& func_) : func{std::move(func_)} {}
-        explicit TypedCommand(const Func& func_) : func{func_} {}
-        void Execute(vk::CommandBuffer cmdbuf) override {
-            func(cmdbuf);
+        explicit TypedCommand(Func&& func_) : CommandBase{&Exec, nullptr}, func{std::move(func_)} {}
+        explicit TypedCommand(const Func& func_) : CommandBase{&Exec, nullptr}, func{func_} {}
+        static void Exec(CommandBase* base, vk::CommandBuffer cmdbuf) {
+            auto* self = static_cast<TypedCommand*>(base);
+            self->func(cmdbuf);
+            if constexpr (!std::is_trivially_destructible_v<Func>) {
+                self->func.~Func();
+            }
         }
         Func func;
     };
@@ -831,7 +1193,8 @@ public:
     /// copy threads (BbCopy::Async) must be done before the guest learns the GPU is past them
     /// (it may then rewrite the memory, e.g. UI vertices: flickering) and before the
     /// submission that reads them. Waits for all.
-    void WaitHostCopies();
+    void WaitHostCopies(u32 line = __builtin_LINE(),
+                        const char* function = __builtin_FUNCTION());
 
     /// Runs `copy` on the recording thread in order with the commands (the thread spins for
     /// work anyway, so small copies cost no wakeup); WaitHostCopies() covers it.
@@ -858,7 +1221,8 @@ public:
     /// fences, flip): waits until every signal handed to SignalAfterHostCopies ran, so that
     /// the write cannot overtake an earlier fence. Otherwise the guest, seeing the later value,
     /// may free memory the earlier fence then writes into (corrupted heap, guest fault).
-    void WaitDeferredSignals();
+    void WaitDeferredSignals(u32 line = __builtin_LINE(),
+                             const char* function = __builtin_FUNCTION());
 
     /// Whether a render pass with exactly this state is open.
     [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
