@@ -102,12 +102,15 @@ public:
     /// `line`/`function`: the caller, for the statistics of where stage A waits.
     void DrainDrawPipe(u32 reason = DrawPipe::ReasonRasterizer, u32 line = __builtin_LINE(),
                        const char* function = __builtin_FUNCTION());
+    void PublishDrawPipe();
+    static bool PipeVerifyEnabled();
+    static bool RingAsyncEnabled();
     /// Runs `task(rasterizer, copy of data)` in order with the draws: on the draw recording
     /// thread while the draw pipeline is in use (PipelinedTasks), else here after a drain.
     using OrderedTask = void (*)(Rasterizer& rasterizer, const u8* data);
     /// Returns true when the task was handed to the recording thread (not run yet).
     bool RunInOrder(OrderedTask task, const void* data, u32 size,
-                    u64 toggle = BbToggle::PipelinedTasks);
+                    u64 toggle = BbToggle::PipelinedTasks, bool invalidate_ring = true);
     /// Stage A: the draw pipe position after the last handed-over packet, and whether the
     /// recording thread has run everything before a position.
     [[nodiscard]] u64 DrawPipeHead() const {
@@ -277,7 +280,7 @@ private:
     void DispatchRecord(const ComputePipeline* pipeline);
     /// The compute registers of the dispatch being recorded.
     const AmdGpu::ComputeProgram& CsRegs() const;
-    static void RunDrawPacket(void* rasterizer, const u8* packet, u32 size);
+    static void RunDrawPacket(void* rasterizer, const u8* packet, u32 size, u64 copy_seq);
     struct RingBinding;
     void CollectRingBindings(const Shader::Info& stage, const PreparedDraw* prepared,
                              boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>& out);
@@ -597,9 +600,29 @@ private:
         return nullptr;
     }
     std::unique_ptr<ConstantRing> constant_ring;
+    u64 constant_ring_alignment = 1;
+    struct RingReuseEntry {
+        VAddr address = 0;
+        u32 size = 0;
+        u64 epoch = 0;
+        u64 offset = 0;
+    };
+    std::array<RingReuseEntry, 4096> ring_reuse{};
+    u64 ring_reuse_epoch = 1;
+    u64 ring_epoch_start = 0;
+    void InvalidateRingReuse() {
+        ++ring_reuse_epoch;
+        if (constant_ring) {
+            ring_epoch_start = constant_ring->Position();
+        }
+    }
+    std::array<boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>,
+               Shader::MaxStageTypes>
+        stage_a_rings{};
     /// Submissions (prepared draws) kept alive until stage B reaches the position.
     std::deque<std::pair<u64, std::shared_ptr<const void>>> pipe_keepalive;
     std::unique_ptr<DrawPipe> draw_pipe;
+    u64 ring_batch_bytes = 0;
     u32 draws_since_submit = 0;
     u32 draws_this_frame = 0;
     u32 last_frame_draws = 0;

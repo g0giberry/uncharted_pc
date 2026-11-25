@@ -12,6 +12,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <x86intrin.h>
+#endif
 
 #include "bbport_toggles.h"
 #include "common/thread.h"
@@ -30,7 +33,7 @@ public:
         if (const char* env = std::getenv("BB_COPY_THREADS")) {
             count = static_cast<unsigned>(std::clamp(std::atoi(env), 0, 16));
         }
-        epochs.emplace_back();
+        free_batches.reserve(16);
         for (unsigned i = 0; i < count; ++i) {
             threads.emplace_back([this, i] { Loop(i); });
         }
@@ -50,45 +53,111 @@ public:
         return !threads.empty();
     }
 
-    void Async(std::function<void()> task) {
-        {
-            std::scoped_lock lk{mutex};
-            const u64 epoch = epoch_base + epochs.size() - 1;
-            ++epochs.back().pending;
-            ++pending;
-            async_tasks.push_back({std::move(task), epoch});
-        }
-        cv.notify_one();
+    u64 IssuedSeq() {
+        std::scoped_lock lk{mutex};
+        return issued_seq;
     }
 
-    void AfterCopies(std::function<void()> callback) {
+    u64 Async(std::function<void()> task) {
+        u64 seq;
+        {
+            std::scoped_lock lk{mutex};
+            seq = ++issued_seq;
+            ++pending;
+            inflight_done.push_back(0);
+            async_tasks.push_back({std::move(task), {}, seq});
+        }
+        cv.notify_one();
+        return seq;
+    }
+
+    u64 SubmitBatch(std::vector<Item>& caller_items) {
+        std::vector<Item> batch_items;
+        {
+            std::scoped_lock lk{mutex};
+            const u64 seq = ++issued_seq;
+            ++pending;
+            inflight_done.push_back(0);
+            if (!free_batches.empty()) {
+                batch_items = std::move(free_batches.back());
+                free_batches.pop_back();
+            }
+            caller_items.swap(batch_items);
+            if (caller_items.capacity() < 256) {
+                caller_items.reserve(256);
+            }
+            async_tasks.push_back({{}, std::move(batch_items), seq});
+            cv.notify_one();
+            return seq;
+        }
+    }
+
+    bool IsComplete(u64 target_seq) const {
+        return completed_seq_atomic.load(std::memory_order_acquire) >= target_seq;
+    }
+
+    void AfterSeq(u64 target_seq, std::function<void()> callback) {
         {
             std::unique_lock lk{mutex};
-            if (epochs.size() > 1 || epochs.back().pending != 0 || draining) {
-                // Runs once every copy issued so far is done, in order with earlier ones.
-                epochs.back().callbacks.push_back(std::move(callback));
-                epochs.emplace_back();
+            if (completed_seq < target_seq || !waiters.empty() || draining) {
+                // Runs once every task with seq <= target_seq is done, in order with earlier ones.
+                waiters.push_back({target_seq, std::move(callback)});
                 return;
             }
         }
         callback();
     }
 
+    void WaitUntil(u64 target_seq) {
+        if (IsComplete(target_seq)) {
+            return;
+        }
+        u32 spins = 0;
+        while (!IsComplete(target_seq)) {
+            Task task;
+            bool popped = false;
+            {
+                std::scoped_lock lk{mutex};
+                if (completed_seq >= target_seq) {
+                    return;
+                }
+                if (!async_tasks.empty() && async_tasks.front().seq <= target_seq) {
+                    task = std::move(async_tasks.front());
+                    async_tasks.pop_front();
+                    popped = true;
+                }
+            }
+            if (popped) {
+                RunAsync(task);
+                spins = 0;
+            } else if (spins < 64) {
+                ++spins;
+#if defined(__x86_64__) || defined(_M_X64)
+                __builtin_ia32_pause();
+#endif
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    }
+
     void WaitAll() {
         // The waiting thread helps instead of only spinning.
         while (true) {
             Task task;
+            bool popped = false;
             {
                 std::scoped_lock lk{mutex};
-                if (pending == 0 && epochs.size() == 1 && !draining) {
+                if (pending == 0 && waiters.empty() && !draining) {
                     return;
                 }
                 if (!async_tasks.empty()) {
                     task = std::move(async_tasks.front());
                     async_tasks.pop_front();
+                    popped = true;
                 }
             }
-            if (task.run) {
+            if (popped) {
                 RunAsync(task);
             } else {
                 std::this_thread::yield();
@@ -121,12 +190,12 @@ private:
     using u64 = unsigned long long;
     struct Task {
         std::function<void()> run;
-        u64 epoch{};
+        std::vector<Item> items;
+        u64 seq{};
     };
-    /// Copies issued between two AfterCopies() calls, and the callbacks waiting for them.
-    struct Epoch {
-        std::size_t pending = 0;
-        std::vector<std::function<void()>> callbacks;
+    struct Waiter {
+        u64 target_seq{};
+        std::function<void()> callback;
     };
     struct Job {
         const std::function<void(std::size_t)>* task{};
@@ -138,29 +207,42 @@ private:
     void RunAsync(Task& task) {
         const bool was = in_copy_thread;
         in_copy_thread = true;
-        task.run();
+        if (task.run) {
+            task.run();
+        } else {
+            for (const auto& item : task.items) {
+                item.run(item);
+            }
+            task.items.clear();
+        }
         in_copy_thread = was;
-        Complete(task.epoch);
+        Complete(task.seq, std::move(task.items));
     }
 
-    /// Retires a task and runs the callbacks of epochs with nothing left, oldest first. One
+    /// Retires a task and runs waiters whose target_seq has completed, oldest first. One
     /// thread drains at a time so the callbacks keep their order.
-    void Complete(u64 epoch) {
+    void Complete(u64 seq, std::vector<Item>&& recycled) {
         std::unique_lock lk{mutex};
-        --epochs[epoch - epoch_base].pending;
+        if (recycled.capacity() > 0 && free_batches.size() < 32) {
+            recycled.clear();
+            free_batches.push_back(std::move(recycled));
+        }
         --pending;
+        inflight_done[seq - completed_seq - 1] = 1;
+        while (!inflight_done.empty() && inflight_done.front()) {
+            inflight_done.pop_front();
+            ++completed_seq;
+        }
+        completed_seq_atomic.store(completed_seq, std::memory_order_release);
         if (draining) {
             return;
         }
         draining = true;
         while (true) {
             std::vector<std::function<void()>> ready;
-            while (epochs.size() > 1 && epochs.front().pending == 0) {
-                for (auto& callback : epochs.front().callbacks) {
-                    ready.push_back(std::move(callback));
-                }
-                epochs.pop_front();
-                ++epoch_base;
+            while (!waiters.empty() && waiters.front().target_seq <= completed_seq) {
+                ready.push_back(std::move(waiters.front().callback));
+                waiters.pop_front();
             }
             if (ready.empty()) {
                 break;
@@ -218,8 +300,12 @@ private:
     u64 generation = 0;
     bool stop = false;
     std::deque<Task> async_tasks;
-    std::deque<Epoch> epochs; ///< back() is open for new copies
-    u64 epoch_base = 0;       ///< epoch number of epochs.front()
+    std::deque<unsigned char> inflight_done;
+    std::deque<Waiter> waiters;
+    std::vector<std::vector<Item>> free_batches;
+    u64 issued_seq = 0;
+    u64 completed_seq = 0;
+    alignas(64) std::atomic<u64> completed_seq_atomic{0};
     std::size_t pending = 0;
     bool draining = false;
 };
@@ -234,6 +320,7 @@ struct Batch {
     unsigned long long bytes = 0;
 };
 thread_local Batch batch;
+thread_local unsigned long long last_submitted_seq = 0;
 
 } // namespace
 
@@ -246,22 +333,43 @@ void Async(std::function<void()> task) {
         task();
         return;
     }
-    GetPool().Async(std::move(task));
+    last_submitted_seq = GetPool().Async(std::move(task));
 }
 
-void FlushBatch() {
+unsigned long long FlushBatch() {
     if (batch.items.empty()) {
-        return;
+        return last_submitted_seq;
     }
-    auto items = std::make_shared<std::vector<Item>>(std::move(batch.items));
-    batch.items = {};
-    batch.items.reserve(256);
-    batch.bytes = 0;
-    Async([items] {
-        for (const auto& item : *items) {
+    if (!Enabled()) {
+        for (const auto& item : batch.items) {
             item.run(item);
         }
-    });
+        batch.items.clear();
+        batch.bytes = 0;
+        return last_submitted_seq;
+    }
+    batch.bytes = 0;
+    last_submitted_seq = GetPool().SubmitBatch(batch.items);
+    return last_submitted_seq;
+}
+
+bool IsComplete(unsigned long long seq) {
+    return seq == 0 || GetPool().IsComplete(seq);
+}
+
+void WaitUntil(unsigned long long seq) {
+    if (seq == 0) {
+        return;
+    }
+    GetPool().WaitUntil(seq);
+}
+
+void AfterSeq(unsigned long long seq, std::function<void()> callback) {
+    if (seq == 0 || !Enabled()) {
+        callback();
+        return;
+    }
+    GetPool().AfterSeq(seq, std::move(callback));
 }
 
 void QueueCopy(const Item& item) {
@@ -279,7 +387,12 @@ void QueueCopy(const Item& item) {
 
 void AfterCopies(std::function<void()> callback) {
     FlushBatch();
-    GetPool().AfterCopies(std::move(callback));
+    if (!Enabled()) {
+        callback();
+        return;
+    }
+    auto& pool = GetPool();
+    pool.AfterSeq(pool.IssuedSeq(), std::move(callback));
 }
 
 void WaitAsync() {

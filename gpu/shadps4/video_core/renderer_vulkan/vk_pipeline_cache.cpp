@@ -549,11 +549,22 @@ bool PipelineCache::PrepareGraphicsPipeline(PipelineSelection& worker_sel) {
     }
     auto& worker = *worker_sel.worker;
     worker.compile = worker_compile;
+    worker_sel.prepared_pipeline = nullptr;
+    worker_sel.prepared_pipeline_gen = 0;
     if (!RefreshGraphicsKey(worker_sel) || worker.failed) {
         return false;
     }
     if (worker.compile) {
         EnsureWorkerPipeline(worker_sel);
+    }
+    if (!worker_sel.prepared_pipeline) {
+        std::shared_lock lock{pipelines_mutex};
+        if (const auto it = graphics_pipelines.find(worker_sel.graphics_key);
+            it != graphics_pipelines.end()) {
+            worker_sel.prepared_pipeline = it->second.get();
+            worker_sel.prepared_pipeline_gen =
+                pipelines_generation.load(std::memory_order_relaxed);
+        }
     }
     return true;
 }
@@ -571,7 +582,10 @@ void PipelineCache::EnsureWorkerPipeline(PipelineSelection& worker_sel) {
     const auto& key = worker_sel.graphics_key;
     {
         std::shared_lock lock{pipelines_mutex};
-        if (graphics_pipelines.contains(key)) {
+        if (const auto it = graphics_pipelines.find(key); it != graphics_pipelines.end()) {
+            worker_sel.prepared_pipeline = it->second.get();
+            worker_sel.prepared_pipeline_gen =
+                pipelines_generation.load(std::memory_order_relaxed);
             return;
         }
     }
@@ -596,7 +610,10 @@ void PipelineCache::EnsureWorkerPipeline(PipelineSelection& worker_sel) {
     AcquireClaim(claim_id);
     {
         std::shared_lock lock{pipelines_mutex};
-        if (graphics_pipelines.contains(key)) {
+        if (const auto it = graphics_pipelines.find(key); it != graphics_pipelines.end()) {
+            worker_sel.prepared_pipeline = it->second.get();
+            worker_sel.prepared_pipeline_gen =
+                pipelines_generation.load(std::memory_order_relaxed);
             ReleaseClaim(claim_id);
             return;
         }
@@ -619,6 +636,7 @@ void PipelineCache::EnsureWorkerPipeline(PipelineSelection& worker_sel) {
         RegisterPipelineData(key, pipeline_hash, sdata);
         num_new_pipelines.fetch_add(1, std::memory_order_relaxed);
         driver_cache_dirty.fetch_add(1, std::memory_order_relaxed);
+        const GraphicsPipeline* created_ptr = pipeline.get();
         std::unique_lock lock{pipelines_mutex};
         if (EmulatorSettings.IsShaderCollect()) {
             for (auto stage = 0; stage < MaxShaderStages; ++stage) {
@@ -627,15 +645,26 @@ void PipelineCache::EnsureWorkerPipeline(PipelineSelection& worker_sel) {
                 }
             }
         }
-        graphics_pipelines.emplace(key, std::move(pipeline));
+        const auto [it_pipe, inserted] = graphics_pipelines.try_emplace(key, std::move(pipeline));
+        worker_sel.prepared_pipeline = inserted ? created_ptr : it_pipe->second.get();
+        worker_sel.prepared_pipeline_gen = pipelines_generation.load(std::memory_order_relaxed);
     }
     runtime_fault_recover = nullptr;
     ReleaseClaim(claim_id);
 }
 
-const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& prepared) {
-    if (prepared.state.load(std::memory_order_acquire) != PreparedDraw::Ready || !IsWarm() ||
-        prepared.reg_checksum != liverpool->gfx_reg_checksum) {
+const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& prepared,
+                                                           bool skip_info_write) {
+    if (prepared.state.load(std::memory_order_acquire) != PreparedDraw::Ready || !IsWarm()) {
+        if (BbStats::stage_a_profile) {
+            ++BbStats::stage_a.prep_miss_state;
+        }
+        return nullptr;
+    }
+    if (prepared.reg_checksum != liverpool->gfx_reg_checksum) {
+        if (BbStats::stage_a_profile) {
+            ++BbStats::stage_a.prep_miss_checksum;
+        }
         return nullptr;
     }
     // Same registers; the stage programs and their flattened user data (which also covers
@@ -645,34 +674,107 @@ const GraphicsPipeline* PipelineCache::TryPreparedPipeline(const PreparedDraw& p
     for (u32 i = 0; i < prepared.num_stages; ++i) {
         const auto& stage = prepared.stages[i];
         const auto* pgm = regs.ProgramForStage(static_cast<u32>(stage.hw_stage));
-        if (!pgm || !pgm->Address<u32*>()) {
+        if (!pgm) {
+            if (BbStats::stage_a_profile) {
+                ++BbStats::stage_a.prep_miss_other;
+            }
             return nullptr;
         }
-        const auto params = AmdGpu::GetParams(*pgm);
-        if (params.hash != stage.hash) {
+        const auto* code = pgm->Address<const u32*>();
+        if (!code || reinterpret_cast<VAddr>(code) != stage.pgm_base ||
+            code[0] != stage.first_word) {
+            if (BbStats::stage_a_profile) {
+                ++BbStats::stage_a.prep_miss_other;
+            }
+            return nullptr;
+        }
+        const auto* bininfo = reinterpret_cast<const AmdGpu::BinaryInfo*>(
+            reinterpret_cast<const u8*>(code) + stage.bininfo_byte_offset);
+        if (!bininfo->Valid() || bininfo->shader_hash != stage.hash) {
+            if (BbStats::stage_a_profile) {
+                ++BbStats::stage_a.prep_miss_other;
+            }
             return nullptr;
         }
         auto& info = const_cast<Program*>(stage.program)->info;
-        info.pgm_base = params.Base();
-        info.user_data = params.user_data;
-        info.RefreshFlatBuf();
-        if (info.pgm_base != stage.pgm_base || info.flattened_ud_buf.size() != stage.flat_size ||
-            std::memcmp(info.flattened_ud_buf.data(), stage.flat,
-                        stage.flat_size * sizeof(u32)) != 0) {
-            return nullptr;
+        if (skip_info_write) {
+            if (stage.flat_size < AmdGpu::NUM_USER_DATA ||
+                std::memcmp(pgm->user_data.data(), stage.flat,
+                            AmdGpu::NUM_USER_DATA * sizeof(u32)) != 0) {
+                if (BbStats::stage_a_profile) {
+                    ++BbStats::stage_a.prep_miss_flat;
+                }
+                return nullptr;
+            }
+            if (!info.srt_info.walker_func) {
+                if (stage.flat_size != AmdGpu::NUM_USER_DATA) {
+                    if (BbStats::stage_a_profile) {
+                        ++BbStats::stage_a.prep_miss_flat;
+                    }
+                    return nullptr;
+                }
+            } else {
+                if (stage.flat_size != info.srt_info.flattened_bufsize_dw) {
+                    if (BbStats::stage_a_profile) {
+                        ++BbStats::stage_a.prep_miss_flat;
+                    }
+                    return nullptr;
+                }
+                u32 flat_stack[512];
+                std::vector<u32> flat_heap;
+                u32* flat_dst = flat_stack;
+                if (stage.flat_size > std::size(flat_stack)) {
+                    flat_heap.resize(stage.flat_size);
+                    flat_dst = flat_heap.data();
+                }
+                std::memcpy(flat_dst, pgm->user_data.data(),
+                            AmdGpu::NUM_USER_DATA * sizeof(u32));
+                info.srt_info.walker_func(pgm->user_data.data(), flat_dst);
+                if (std::memcmp(flat_dst + AmdGpu::NUM_USER_DATA,
+                                stage.flat + AmdGpu::NUM_USER_DATA,
+                                (stage.flat_size - AmdGpu::NUM_USER_DATA) * sizeof(u32)) != 0) {
+                    if (BbStats::stage_a_profile) {
+                        ++BbStats::stage_a.prep_miss_flat;
+                    }
+                    return nullptr;
+                }
+            }
+        } else {
+            info.pgm_base = stage.pgm_base;
+            info.user_data = pgm->user_data;
+            info.RefreshFlatBuf();
+            if (info.flattened_ud_buf.size() != stage.flat_size ||
+                std::memcmp(info.flattened_ud_buf.data(), stage.flat,
+                            stage.flat_size * sizeof(u32)) != 0) {
+                if (BbStats::stage_a_profile) {
+                    ++BbStats::stage_a.prep_miss_flat;
+                }
+                return nullptr;
+            }
         }
+    }
+    if (prepared.pipeline &&
+        prepared.pipeline_gen == pipelines_generation.load(std::memory_order_acquire)) {
+        return prepared.pipeline;
     }
     std::shared_lock lock{pipelines_mutex};
     const auto it = graphics_pipelines.find(prepared.key);
-    return it != graphics_pipelines.end() ? it->second.get() : nullptr;
+    if (it == graphics_pipelines.end()) {
+        if (BbStats::stage_a_profile) {
+            ++BbStats::stage_a.prep_miss_other;
+        }
+        return nullptr;
+    }
+    return it->second.get();
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
-                                                           const PreparedDraw* prepared) {
+                                                           const PreparedDraw* prepared,
+                                                           bool skip_info_write) {
     EnsureWarm();
     used_prepared = nullptr;
     if (prepared) {
-        if (const auto* pipeline = TryPreparedPipeline(*prepared)) {
+        if (const auto* pipeline = TryPreparedPipeline(*prepared, skip_info_write)) {
             used_prepared = prepared;
             return pipeline;
         }
@@ -733,54 +835,223 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     return result;
 }
 
+namespace {
+bool SpecMatchesCompute(const Shader::Info& info, const Shader::StageSpecialization& cached) {
+    if (!cached.Valid() || !cached.vs_attribs.empty() || cached.fetch_shader_data.has_value() ||
+        cached.buffers.size() != info.buffers.size() ||
+        cached.images.size() != info.images.size() ||
+        cached.fmasks.size() != info.fmasks.size() ||
+        cached.samplers.size() != info.samplers.size()) {
+        return false;
+    }
+    for (u32 i = 0; i < info.fmasks.size(); ++i) {
+        const auto sharp = info.fmasks[i].GetSharp(info);
+        if ((sharp ? sharp.width : 0u) != cached.fmasks[i].width ||
+            (sharp ? sharp.height : 0u) != cached.fmasks[i].height) {
+            return false;
+        }
+    }
+    bool any_fresh_bit = false;
+    u32 binding = 0;
+    for (u32 i = 0; i < info.buffers.size(); ++i) {
+        const auto& desc = info.buffers[i];
+        const auto sharp = desc.GetSharp(info);
+        if (sharp) {
+            any_fresh_bit = true;
+            Shader::BufferSpecialization bs{};
+            bs.stride = sharp.GetStride();
+            bs.is_formatted = desc.is_formatted;
+            bs.swizzle_enable = sharp.swizzle_enable;
+            if (bs.is_formatted) {
+                bs.data_format = static_cast<u32>(sharp.GetDataFmt());
+                bs.num_format = static_cast<u32>(sharp.GetNumberFmt());
+                bs.dst_select = sharp.DstSelect();
+                bs.num_conversion = sharp.GetNumberConversion();
+            }
+            if (bs.swizzle_enable) {
+                bs.index_stride = sharp.index_stride;
+                bs.element_size = sharp.element_size;
+            }
+            if (cached.bitset[binding] && bs != cached.buffers[i]) {
+                return false;
+            }
+        }
+        ++binding;
+    }
+    for (u32 i = 0; i < info.images.size(); ++i) {
+        const auto& desc = info.images[i];
+        const auto sharp = desc.GetSharp(info);
+        if (sharp) {
+            any_fresh_bit = true;
+            Shader::ImageSpecialization is{};
+            is.type = sharp.GetViewType(desc.is_array);
+            is.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
+            is.is_storage = desc.is_written;
+            is.is_cube = sharp.IsCube();
+            if (is.is_storage) {
+                is.dst_select = sharp.DstSelect();
+            } else {
+                is.is_srgb = sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb;
+            }
+            is.num_conversion = sharp.GetNumberConversion();
+            is.num_bindings = desc.NumBindings(info);
+            if (cached.bitset[binding] && is != cached.images[i]) {
+                return false;
+            }
+        }
+        ++binding;
+    }
+    if (cached.bitset.none() && !any_fresh_bit) {
+        return true;
+    }
+    if (cached.start != Shader::Backend::Bindings{}) {
+        return false;
+    }
+    for (u32 i = 0; i < info.samplers.size(); ++i) {
+        const auto sharp = info.samplers[i].GetSharp(info);
+        Shader::SamplerSpecialization ss{};
+        if (sharp) {
+            ss.force_unnormalized = sharp.force_unnormalized;
+            ss.force_degamma = sharp.force_degamma;
+        }
+        if (ss != cached.samplers[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+} // namespace
+
+const ComputePipeline* PipelineCache::TryFastComputePipeline(bool indirect) {
+    const auto& cs_pgm = liverpool->GetCsRegs();
+    const auto* code = cs_pgm.Address<const u32*>();
+    if (!code) {
+        return nullptr;
+    }
+    const VAddr pgm_base = reinterpret_cast<VAddr>(code);
+    auto& entry = compute_fast_cache[(pgm_base >> 6) & (compute_fast_cache.size() - 1)];
+    if (!entry.pipeline || entry.pgm_base != pgm_base || entry.first_word != code[0] ||
+        entry.pipelines_gen != pipelines_generation.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+    const auto* bininfo = reinterpret_cast<const AmdGpu::BinaryInfo*>(
+        reinterpret_cast<const u8*>(code) + entry.bininfo_byte_offset);
+    if (!bininfo->Valid() || bininfo->shader_hash != entry.shader_hash) {
+        return nullptr;
+    }
+    const auto& rt = entry.runtime_info;
+    if (rt.props.num_user_data != cs_pgm.settings.num_user_regs ||
+        rt.props.num_allocated_vgprs != cs_pgm.settings.num_vgprs * 4 ||
+        rt.props.fp_denorm_mode32 != cs_pgm.settings.fp_denorm_mode32 ||
+        rt.props.fp_denorm_mode16_64 != cs_pgm.settings.fp_denorm_mode64 ||
+        rt.props.fp_round_mode32 != cs_pgm.settings.fp_round_mode32 ||
+        rt.props.fp_round_mode16_64 != cs_pgm.settings.fp_round_mode64 ||
+        rt.hw.cs.workgroup_size[0] != cs_pgm.num_thread_x.full ||
+        rt.hw.cs.workgroup_size[1] != cs_pgm.num_thread_y.full ||
+        rt.hw.cs.workgroup_size[2] != cs_pgm.num_thread_z.full ||
+        rt.hw.cs.tgid_enable[0] != cs_pgm.IsTgidEnabled(0) ||
+        rt.hw.cs.tgid_enable[1] != cs_pgm.IsTgidEnabled(1) ||
+        rt.hw.cs.tgid_enable[2] != cs_pgm.IsTgidEnabled(2) ||
+        rt.hw.cs.shared_memory_size != cs_pgm.SharedMemSize() ||
+        rt.hw.cs.indirect != indirect) {
+        return nullptr;
+    }
+    auto& info = entry.program->info;
+    info.pgm_base = pgm_base;
+    info.user_data = cs_pgm.user_data;
+    info.RefreshFlatBuf();
+    if (!SpecMatchesCompute(info, entry.spec)) {
+        return nullptr;
+    }
+    if (BbStats::stage_a_profile) {
+        ++BbStats::stage_a.cs_fast_hits;
+    }
+    return entry.pipeline;
+}
+
 const ComputePipeline* PipelineCache::GetComputePipeline(bool indirect) {
     EnsureWarm();
+    if (const auto* fast = TryFastComputePipeline(indirect)) {
+        return fast;
+    }
+    if (BbStats::stage_a_profile) {
+        ++BbStats::stage_a.cs_fast_misses;
+    }
+    last_cs_program = nullptr;
     sel.indirect_dispatch = indirect;
     if (!RefreshComputeKey()) {
         return nullptr;
     }
-    {
-        std::shared_lock lock{pipelines_mutex};
-        const auto it = compute_pipelines.find(compute_key);
-        if (it != compute_pipelines.end()) {
-            return it->second.get();
-        }
-    }
-    // A draw-preparation worker may be building it right now: wait for that instead of
-    // repeating the compile.
-    const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
-    const u64 claim_id = pipeline_hash ^ PipelineClaimTag;
-    AcquireClaim(claim_id);
-    {
-        std::shared_lock lock{pipelines_mutex};
-        const auto it = compute_pipelines.find(compute_key);
-        if (it != compute_pipelines.end()) {
-            ReleaseClaim(claim_id);
-            return it->second.get();
-        }
-    }
-    LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
-    CompileTimer timer{"cpipe", pipeline_hash, u32(liverpool->CurrentQueueId())};
-
-    ComputePipeline::SerializationSupport sdata{};
-    auto pipeline = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                      *pipeline_cache, compute_key, *sel.infos[0],
-                                                      sel.modules[0], sdata, false);
-    RegisterPipelineData(compute_key, sdata);
-    num_new_pipelines.fetch_add(1, std::memory_order_relaxed);
-    driver_cache_dirty.fetch_add(1, std::memory_order_relaxed);
-
     const ComputePipeline* result = nullptr;
     {
-        std::unique_lock lock{pipelines_mutex};
-        if (EmulatorSettings.IsShaderCollect()) {
-            auto& m = sel.modules[0];
-            module_related_pipelines[m].emplace_back(compute_key);
+        std::shared_lock lock{pipelines_mutex};
+        const auto it = compute_pipelines.find(compute_key);
+        if (it != compute_pipelines.end()) {
+            result = it->second.get();
         }
-        // The preload may have inserted the same one meanwhile: keep that.
-        result = compute_pipelines.try_emplace(compute_key, std::move(pipeline)).first->second.get();
     }
-    ReleaseClaim(claim_id);
+    if (!result) {
+        // A draw-preparation worker may be building it right now: wait for that instead of
+        // repeating the compile.
+        const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
+        const u64 claim_id = pipeline_hash ^ PipelineClaimTag;
+        AcquireClaim(claim_id);
+        {
+            std::shared_lock lock{pipelines_mutex};
+            const auto it = compute_pipelines.find(compute_key);
+            if (it != compute_pipelines.end()) {
+                result = it->second.get();
+            }
+        }
+        if (!result) {
+            LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+            CompileTimer timer{"cpipe", pipeline_hash, u32(liverpool->CurrentQueueId())};
+
+            ComputePipeline::SerializationSupport sdata{};
+            auto pipeline = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+                                                              *pipeline_cache, compute_key, *sel.infos[0],
+                                                              sel.modules[0], sdata, false);
+            RegisterPipelineData(compute_key, sdata);
+            num_new_pipelines.fetch_add(1, std::memory_order_relaxed);
+            driver_cache_dirty.fetch_add(1, std::memory_order_relaxed);
+
+            {
+                std::unique_lock lock{pipelines_mutex};
+                if (EmulatorSettings.IsShaderCollect()) {
+                    auto& m = sel.modules[0];
+                    module_related_pipelines[m].emplace_back(compute_key);
+                }
+                // The preload may have inserted the same one meanwhile: keep that.
+                result = compute_pipelines.try_emplace(compute_key, std::move(pipeline)).first->second.get();
+            }
+        }
+        ReleaseClaim(claim_id);
+    }
+    if (result && last_cs_program) {
+        const auto& cs_pgm = liverpool->GetCsRegs();
+        if (const auto* code = cs_pgm.Address<const u32*>()) {
+            const VAddr pgm_base = reinterpret_cast<VAddr>(code);
+            const auto& bininfo = AmdGpu::SearchBinaryInfo(code);
+            auto& entry = compute_fast_cache[(pgm_base >> 6) & (compute_fast_cache.size() - 1)];
+            std::shared_lock lk{programs_mutex};
+            if (last_cs_perm_idx < last_cs_program->modules.size()) {
+                const auto& cached_spec = last_cs_program->modules[last_cs_perm_idx].spec;
+                if (!cached_spec.fetch_shader_data.has_value() && cached_spec.vs_attribs.empty()) {
+                    entry.pgm_base = pgm_base;
+                    entry.first_word = code[0];
+                    entry.bininfo_byte_offset = static_cast<u32>(
+                        reinterpret_cast<const u8*>(&bininfo) -
+                        reinterpret_cast<const u8*>(code));
+                    entry.shader_hash = bininfo.shader_hash;
+                    entry.pipelines_gen = pipelines_generation.load(std::memory_order_acquire);
+                    entry.program = last_cs_program;
+                    entry.pipeline = result;
+                    entry.runtime_info = sel.runtime_infos[u32(SwStage::Compute)];
+                    entry.spec = cached_spec;
+                }
+            }
+        }
+    }
     return result;
 }
 
@@ -1331,6 +1602,11 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
             runtime_fault_recover = &recover;
             info.RefreshFlatBuf();
             auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+            const u32* code = params.code.data();
+            const auto& bininfo = AmdGpu::SearchBinaryInfo(code);
+            const u32 bininfo_byte_offset = static_cast<u32>(
+                reinterpret_cast<const u8*>(&bininfo) - reinterpret_cast<const u8*>(code));
+            const u32 first_word = code[0];
             runtime_fault_recover = nullptr;
             size_t perm_idx = 0;
             vk::ShaderModule module{};
@@ -1355,8 +1631,8 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                 continue;
             }
             info.AddBindings(binding);
-            worker.stages.push_back(
-                {program, params.hash, hw_stage, info.pgm_base, &info.flattened_ud_buf});
+            worker.stages.push_back({program, params.hash, hw_stage, info.pgm_base,
+                                     &info.flattened_ud_buf, bininfo_byte_offset, first_word});
             return std::make_tuple(&info, module, fetch_shader,
                                    HashCombine(params.hash, perm_idx));
         }
@@ -1372,6 +1648,10 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
             const auto created = CreateProgram(hw_stage, sw_stage, params, runtime_info, binding,
                                                pools);
             ReleaseClaim(params.hash);
+            if (hw_stage == HwStage::Compute) {
+                last_cs_program = created.program;
+                last_cs_perm_idx = 0;
+            }
             return std::make_tuple(&created.program->info, created.module, created.fetch_shader,
                                    created.perm_hash);
         }
@@ -1432,11 +1712,19 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
             std::unique_lock lk{programs_mutex};
             program->AddPermut(module, std::move(spec));
             ReleaseClaim(params.hash);
+            if (hw_stage == HwStage::Compute) {
+                last_cs_program = program;
+                last_cs_perm_idx = perm_idx;
+            }
             return std::make_tuple(&program->info, module, fetch_shader, perm_hash);
         }
         ReleaseClaim(params.hash);
     }
     info.AddBindings(binding);
+    if (hw_stage == HwStage::Compute) {
+        last_cs_program = program;
+        last_cs_perm_idx = perm_idx;
+    }
     return std::make_tuple(&program->info, module, fetch_shader, HashCombine(params.hash, perm_idx));
 }
 
@@ -1492,6 +1780,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
                                                              std::span<const u32> spv_code) {
     std::optional<vk::ShaderModule> new_module{};
     std::scoped_lock replace_lock{programs_mutex, pipelines_mutex};
+    pipelines_generation.fetch_add(1, std::memory_order_release);
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {
             if (m.module == module) {

@@ -20,6 +20,7 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
+#include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
@@ -140,7 +141,9 @@ public:
     [[nodiscard]] bool IsRegionCpuModified(VAddr addr, size_t size);
 
     /// Return true when a region is modified from the GPU
-    [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
+    [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size) {
+        return memory_tracker->IsRegionGpuModified(addr, size);
+    }
 
     /// bbport: whether buffers the GPU wrote cover any byte of the range. The page tracker
     /// (IsRegionGpuModified) flags whole 4 KiB pages, and so the bytes next to GPU data.

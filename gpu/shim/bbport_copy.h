@@ -26,12 +26,22 @@ struct Item {
 };
 
 /// Queues a small copy in the calling thread's batch; the batch is started with Async() once it
-/// holds about 512 KiB or 256 items, or by FlushBatch()/WaitAsync(). One wakeup per batch
-/// instead of one per copy (thousands of constant buffer copies per frame).
+/// holds about 512 KiB or 256 items, or by FlushBatch()/WaitAsync(). Returns the highest BbCopy
+/// sequence number submitted by the calling thread so far (0 if none).
 void QueueCopy(const Item& item);
 
-/// Starts the calling thread's batch.
-void FlushBatch();
+/// Starts the calling thread's batch and returns the calling thread's latest submitted sequence.
+unsigned long long FlushBatch();
+
+/// Lock-free check: true once every BbCopy task with sequence <= `seq` has finished.
+bool IsComplete(unsigned long long seq);
+
+/// Waits (helping only tasks with sequence <= `seq`) until IsComplete(`seq`) is true.
+void WaitUntil(unsigned long long seq);
+
+/// Runs `callback` once every BbCopy task with sequence <= `seq` has finished (immediately if
+/// already complete and no earlier callbacks are pending). Callbacks run in registration order.
+void AfterSeq(unsigned long long seq, std::function<void()> callback);
 
 /// Starts the calling thread's batch, then waits until every task passed to Async() so far
 /// has finished.

@@ -19,7 +19,7 @@ namespace Vulkan {
 
 class ConstantRing {
 public:
-    static constexpr u64 Capacity = 32ull << 20;
+    static constexpr u64 Capacity = 64ull << 20;
 
     ConstantRing(const Instance& instance, Scheduler& scheduler_)
         : scheduler{scheduler_},
@@ -55,7 +55,9 @@ public:
 
     /// Stage A, after writing: makes the bytes visible to the GPU.
     void Flush(u64 offset, u64 size) {
-        buffer.Flush(offset, size);
+        if (!buffer.is_coherent) {
+            buffer.Flush(offset, size);
+        }
     }
 
     /// Stage A: the position the next packet's allocations end at.
@@ -63,29 +65,42 @@ public:
         return position;
     }
 
-    /// Stage B, after recording a packet whose allocations end at `end`. Stamps of one
-    /// submission tick are merged: only the last end per tick is published.
-    void Stamp(u64 end) {
-        if (end == pending_end) {
+    /// Stage B, after recording a packet whose epoch starts at `start` and allocations end at `end`.
+    /// Stamps of one submission tick are merged.
+    void Stamp(u64 start, u64 end, bool used_ring) {
+        if (!used_ring && end == pending_end) {
             return;
         }
         const u64 tick = scheduler.CurrentTick();
-        if (tick != pending_tick && pending_end != last_published) {
-            Publish(pending_end, pending_tick);
+        if (pending_dirty && tick != pending_tick) {
+            if (Publish(pending_start, pending_end, pending_tick)) {
+                pending_start = start;
+                pending_dirty = false;
+            } else {
+                pending_start = std::min(pending_start, start);
+            }
+        }
+        if (!pending_dirty) {
+            pending_start = start;
+        } else {
+            pending_start = std::min(pending_start, start);
         }
         pending_end = end;
         pending_tick = tick;
+        pending_dirty = true;
+        active_start.store(pending_start, std::memory_order_release);
     }
 
 private:
-    void Publish(u64 end, u64 tick) {
+    bool Publish(u64 start, u64 end, u64 tick) {
         const u64 at = stamps_head.load(std::memory_order_relaxed);
         if (at - stamps_tail.load(std::memory_order_acquire) >= stamps.size()) {
-            return; // full: this region retires with a later stamp
+            return false; // full: this region retires with a later stamp
         }
-        stamps[at % stamps.size()] = {end, tick};
+        stamps[at % stamps.size()] = {start, end, tick};
         stamps_head.store(at + 1, std::memory_order_release);
         last_published = end;
+        return true;
     }
 
     void Retire() {
@@ -93,14 +108,22 @@ private:
         semaphore->Refresh();
         u64 at = stamps_tail.load(std::memory_order_relaxed);
         const u64 head = stamps_head.load(std::memory_order_acquire);
+        u64 freed_end = retired;
         while (at < head && semaphore->IsFree(stamps[at % stamps.size()].tick)) {
-            retired = stamps[at % stamps.size()].end;
+            freed_end = stamps[at % stamps.size()].end;
             ++at;
         }
         stamps_tail.store(at, std::memory_order_release);
+        const u64 min_in_flight =
+            (at < head) ? stamps[at % stamps.size()].start : active_start.load(std::memory_order_acquire);
+        const u64 safe_retired = std::min(freed_end, min_in_flight);
+        if (safe_retired > retired) {
+            retired = safe_retired;
+        }
     }
 
     struct StampEntry {
+        u64 start;
         u64 end;
         u64 tick;
     };
@@ -108,10 +131,12 @@ private:
     VideoCore::Buffer buffer;
     u64 position = 0;     ///< stage A
     u64 retired = 0;      ///< stage A: the GPU is done with everything before this
-    u64 pending_end = 0, pending_tick = 0, last_published = 0; ///< stage B
+    u64 pending_start = 0, pending_end = 0, pending_tick = 0, last_published = 0; ///< stage B
+    bool pending_dirty = false;
     std::array<StampEntry, 1024> stamps{};
-    alignas(64) std::atomic<u64> stamps_head{0}; ///< stage B writes
-    alignas(64) std::atomic<u64> stamps_tail{0}; ///< stage A reads
+    alignas(64) std::atomic<u64> stamps_head{0};  ///< stage B writes
+    alignas(64) std::atomic<u64> stamps_tail{0};  ///< stage A reads
+    alignas(64) std::atomic<u64> active_start{0}; ///< stage B writes, stage A reads
 };
 
 } // namespace Vulkan

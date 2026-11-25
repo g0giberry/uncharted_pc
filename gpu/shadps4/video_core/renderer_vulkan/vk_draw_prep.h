@@ -50,6 +50,8 @@ struct PreparedStage {
     const AmdGpu::Sampler* sampler_sharps;
     const AmdGpu::Buffer* buffer_sharps;
     u32 num_images, num_samplers, num_buffers;
+    u32 bininfo_byte_offset{};
+    u32 first_word{};
 };
 
 /// Key of Rasterizer's texture description cache for a T# bound through `res`.
@@ -86,6 +88,8 @@ struct PreparedDraw {
     std::atomic<u32> state{Pending};
     u64 reg_checksum{};
     GraphicsPipelineKey key{};
+    const GraphicsPipeline* pipeline{};
+    u64 pipeline_gen{};
     u32 num_stages{};
     std::array<PreparedStage, MaxShaderStages> stages{};
     PreparedVertexInputs vertex{};

@@ -160,4 +160,37 @@ inline std::atomic<std::uint64_t> protect_calls{0}, protect_pages{0}, protect_re
     protect_revoke_pages{0};
 void NoteHostCopyWait(const char* kind, const char* fn, std::uint32_t line, std::uint64_t ns);
 void PrintHostCopyWaits(double window_s);
+inline const bool stage_a_profile = [] {
+    const char* env = std::getenv("BB_STAGE_A_PROFILE");
+    return env && env[0] == '1';
+}();
+struct StageAProfile {
+    std::uint64_t pm4_cycles = 0;
+    std::uint64_t pipeline_cycles = 0;
+    std::uint64_t maybe_submit_cycles = 0;
+    std::uint64_t collect_ring_cycles = 0;
+    std::uint64_t post_draw_cycles = 0;
+    std::uint64_t idle_cycles = 0;
+    std::uint64_t dispatch_pipe_cycles = 0;
+    std::uint64_t dispatch_calls = 0;
+    std::uint64_t indirect_pipe_cycles = 0;
+    std::uint64_t indirect_calls = 0;
+    std::uint64_t onsubmit_cycles = 0;
+    std::uint64_t ring_reuse_hits = 0;
+    std::uint64_t ring_reuse_misses = 0;
+    std::uint64_t ring_skips = 0;
+    std::uint64_t ring_bytes_copied = 0;
+    std::uint64_t ring_async_copies = 0;
+    std::uint64_t ring_sync_copies = 0;
+    std::uint64_t post_draw_calls = 0;
+    std::uint64_t post_draw_blocks = 0;
+    std::uint64_t post_draw_bytes = 0;
+    std::uint64_t cs_fast_hits = 0;
+    std::uint64_t cs_fast_misses = 0;
+    std::uint64_t prep_miss_state = 0;
+    std::uint64_t prep_miss_checksum = 0;
+    std::uint64_t prep_miss_flat = 0;
+    std::uint64_t prep_miss_other = 0;
+};
+inline StageAProfile stage_a{};
 } // namespace BbStats

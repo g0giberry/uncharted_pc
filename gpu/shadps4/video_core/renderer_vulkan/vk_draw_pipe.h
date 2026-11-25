@@ -31,9 +31,11 @@ namespace Vulkan {
 class DrawPipe {
 public:
     /// Runs a packet on stage B.
-    using Handler = void (*)(void* context, const u8* packet, u32 size);
+    using Handler = void (*)(void* context, const u8* packet, u32 size, u64 copy_seq);
+    using PublishHook = u64 (*)();
 
-    DrawPipe(Handler handler_, void* context_) : handler{handler_}, context{context_} {
+    DrawPipe(Handler handler_, void* context_, PublishHook on_publish_ = nullptr)
+        : handler{handler_}, context{context_}, on_publish{on_publish_} {
         ring = std::make_unique<u8[]>(Capacity);
         thread = std::jthread([this](std::stop_token stop) { Run(stop); });
     }
@@ -67,7 +69,7 @@ public:
             reinterpret_cast<Header*>(ring.get() + offset)->size = 0;
             at += Capacity - offset;
             head = at;
-            published.store(at, std::memory_order_release);
+            Publish();
         }
         WaitForSpace(at, size);
         pending_size = size;
@@ -76,15 +78,42 @@ public:
         return reinterpret_cast<u8*>(header + 1);
     }
 
-    /// Stage A: hands the packet from Begin() to stage B.
-    void Commit(u32 payload_size) {
-        reinterpret_cast<Header*>(ring.get() + head % Capacity)->payload = payload_size;
-        head += pending_size;
+    [[nodiscard]] u32 UnpublishedPackets() const noexcept {
+        return unpublished_packets;
+    }
+
+    /// Stage A: flushes queued copy work if needed and exposes all packets up to `head`.
+    void Publish() {
+        if (published_local == head) {
+            return;
+        }
+        const u64 seq = on_publish ? on_publish() : 0;
+        for (u64 walk = published_local; walk < head;) {
+            auto* h = reinterpret_cast<Header*>(ring.get() + walk % Capacity);
+            if (h->size == 0) {
+                walk += Capacity - walk % Capacity;
+                continue;
+            }
+            h->copy_seq = seq;
+            walk += h->size;
+        }
+        published_local = head;
+        unpublished_packets = 0;
         published.store(head, std::memory_order_seq_cst);
-        ++packets;
         if (sleeping.load(std::memory_order_seq_cst)) {
             wake.fetch_add(1, std::memory_order_seq_cst);
             wake.notify_one();
+        }
+    }
+
+    /// Stage A: hands the packet from Begin() to stage B.
+    void Commit(u32 payload_size, bool publish = true) {
+        reinterpret_cast<Header*>(ring.get() + head % Capacity)->payload = payload_size;
+        head += pending_size;
+        ++packets;
+        ++unpublished_packets;
+        if (publish) {
+            Publish();
         }
     }
 
@@ -103,6 +132,10 @@ public:
 
     /// Stage A: waits until stage B has run every committed packet.
     void Drain(u32 reason = ReasonRasterizer) {
+        if (on_publish) {
+            on_publish();
+        }
+        Publish();
         if (consumed.load(std::memory_order_acquire) == head) {
             return;
         }
@@ -131,7 +164,7 @@ public:
     }
 
     [[nodiscard]] bool Idle() const noexcept {
-        return consumed.load(std::memory_order_acquire) == head;
+        return published_local == head && consumed.load(std::memory_order_acquire) == head;
     }
 
     /// Statistics (stage A): packets, drains that had to wait, cycles waited, cycles stage B
@@ -143,6 +176,7 @@ private:
     struct Header {
         u32 size;    ///< bytes to the next packet (0: wrap to the ring start)
         u32 payload; ///< bytes written by the producer
+        u64 copy_seq;
     };
     static constexpr u64 Capacity = 16ull << 20;
 
@@ -151,6 +185,9 @@ private:
     }
 
     void WaitForSpace(u64 at, u64 size) {
+        if (at + size - consumed.load(std::memory_order_acquire) > Capacity) {
+            Publish();
+        }
         while (at + size - consumed.load(std::memory_order_acquire) > Capacity) {
             __builtin_ia32_pause();
         }
@@ -199,7 +236,8 @@ private:
                 continue;
             }
             const u64 start = __rdtsc();
-            handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
+            handler(context, reinterpret_cast<const u8*>(header + 1), header->payload,
+                    header->copy_seq);
             busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
             at += header->size;
             consumed.store(at, std::memory_order_release);
@@ -209,8 +247,11 @@ private:
     static inline thread_local bool on_stage_b = false;
     Handler handler;
     void* context;
+    PublishHook on_publish = nullptr;
     std::unique_ptr<u8[]> ring;
     u64 head = 0; ///< stage A's write position
+    u64 published_local = 0;
+    u32 unpublished_packets = 0;
     u32 pending_size = 0;
     alignas(64) std::atomic<u64> published{0};
     alignas(64) std::atomic<u64> consumed{0};

@@ -1195,6 +1195,13 @@ public:
     /// submission that reads them. Waits for all.
     void WaitHostCopies(u32 line = __builtin_LINE(),
                         const char* function = __builtin_FUNCTION());
+    void WaitCopyThreads();
+
+    void NoteRequiredCopySeq(u64 seq) noexcept {
+        if (seq > required_copy_seq) {
+            required_copy_seq = seq;
+        }
+    }
 
     /// Runs `copy` on the recording thread in order with the commands (the thread spins for
     /// work anyway, so small copies cost no wakeup); WaitHostCopies() covers it.
@@ -1323,6 +1330,8 @@ private:
     bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
     u64 host_copies_issued = 0;
     std::atomic<u64> host_copies_done{0};
+    u64 required_copy_seq = 0;
+    std::atomic<u64> deferred_signals_max_seq{0};
     std::atomic<u64> deferred_signals_issued{0}; ///< by the thread recording (A or B)
     std::shared_ptr<std::atomic<u64>> deferred_signals_done =
         std::make_shared<std::atomic<u64>>(0);

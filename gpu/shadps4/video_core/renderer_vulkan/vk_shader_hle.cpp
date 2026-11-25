@@ -354,6 +354,9 @@ static bool ExecuteScalarCopyHLE(const Shader::Info& info, const AmdGpu::Compute
             }
             if (!deferred && (!src_written || sync) && memory->IsValidGpuMapping(src.base_address, size) &&
                 memory->IsValidGpuMapping(dst.base_address, size)) {
+                if (Rasterizer::RingAsyncEnabled()) {
+                    rasterizer.GetRuntime().GetScheduler().WaitCopyThreads();
+                }
                 memory->TryWriteBacking(reinterpret_cast<void*>(dst.base_address),
                                         reinterpret_cast<const void*>(src.base_address), size);
             }
@@ -377,8 +380,13 @@ static bool ExecuteScalarCopyHLE(const Shader::Info& info, const AmdGpu::Compute
         }
     }
     if (!memory->IsValidGpuMapping(src.base_address, size) ||
-        !memory->IsValidGpuMapping(dst.base_address, size) ||
-        !memory->TryWriteBacking(reinterpret_cast<void*>(dst.base_address),
+        !memory->IsValidGpuMapping(dst.base_address, size)) {
+        return false;
+    }
+    if (Rasterizer::RingAsyncEnabled()) {
+        rasterizer.GetRuntime().GetScheduler().WaitCopyThreads();
+    }
+    if (!memory->TryWriteBacking(reinterpret_cast<void*>(dst.base_address),
                                  reinterpret_cast<const void*>(src.base_address), size)) {
         return false;
     }

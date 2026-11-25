@@ -558,6 +558,8 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
                 if (pipeline_cache.PrepareGraphicsPipeline(sel)) {
                     draw.reg_checksum = checksum;
                     draw.key = sel.graphics_key;
+                    draw.pipeline = sel.prepared_pipeline;
+                    draw.pipeline_gen = sel.prepared_pipeline_gen;
                     draw.num_stages = static_cast<u32>(prep_worker.stages.size());
                     for (u32 i = 0; i < draw.num_stages; ++i) {
                         const auto& stage = prep_worker.stages[i];
@@ -568,6 +570,8 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
                             .pgm_base = stage.pgm_base,
                             .flat = arena.Append(*stage.flat),
                             .flat_size = static_cast<u32>(stage.flat->size()),
+                            .bininfo_byte_offset = stage.bininfo_byte_offset,
+                            .first_word = stage.first_word,
                         };
                         PrepareResources(prep_worker.infos.at(stage.program), draw.stages[i],
                                          arena);

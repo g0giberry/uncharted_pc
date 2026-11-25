@@ -1545,10 +1545,6 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionCpuModified(addr, size);
 }
 
-bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
-    return memory_tracker->IsRegionGpuModified(addr, size);
-}
-
 void BufferCache::ProcessFaultBuffer() {
     fault_manager->ProcessFaultBuffer();
 }

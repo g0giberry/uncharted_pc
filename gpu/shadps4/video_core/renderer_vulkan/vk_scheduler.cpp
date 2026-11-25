@@ -16,6 +16,7 @@
 
 #include "bbport_copy.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/landing_gate.h"
 #include "bbport_toggles.h"
 #include "common/assert.h"
@@ -318,12 +319,17 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal, u64 landing_
         signal();
         return;
     }
-    BbCopy::FlushBatch();
+    const u64 target_seq = std::max(required_copy_seq, BbCopy::FlushBatch());
+    u64 prev = deferred_signals_max_seq.load(std::memory_order_relaxed);
+    while (target_seq > prev &&
+           !deferred_signals_max_seq.compare_exchange_weak(prev, target_seq,
+                                                           std::memory_order_release,
+                                                           std::memory_order_relaxed)) {}
     deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
-    Record([signal = std::move(signal), done = deferred_signals_done, landing_seq,
-            off_recorder](vk::CommandBuffer) mutable {
-        BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done), landing_seq,
-                             off_recorder] {
+    Record([signal = std::move(signal), done = deferred_signals_done, landing_seq, off_recorder,
+            target_seq](vk::CommandBuffer) mutable {
+        BbCopy::AfterSeq(target_seq, [signal = std::move(signal), done = std::move(done),
+                                      landing_seq, off_recorder] {
             auto fire = [signal = std::move(signal), done = std::move(done)] {
                 signal();
                 done->fetch_add(1, std::memory_order_release);
@@ -355,13 +361,26 @@ void Scheduler::WaitDeferredSignals(u32 line, const char* function) {
             break; // shutdown: the labels waiting on the landing thread were dropped
         }
         // Helps the copy threads the signals wait for.
-        BbCopy::WaitAsync();
+        BbCopy::WaitUntil(deferred_signals_max_seq.load(std::memory_order_acquire));
         std::this_thread::yield();
     }
     const u64 ns = static_cast<u64>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
             .count());
     BbStats::NoteHostCopyWait(gate_active ? "SignalGate" : "SignalRec", function, line, ns);
+}
+
+void Scheduler::WaitCopyThreads() {
+    if (DrawPipe::OnStageB()) {
+        const u64 target_seq = std::max(required_copy_seq, BbCopy::FlushBatch());
+        if (!BbCopy::IsComplete(target_seq)) {
+            BbStats::WaitTimer timer{BbStats::copy_threads_wait_ns};
+            BbCopy::WaitUntil(target_seq);
+        }
+    } else {
+        BbStats::WaitTimer timer{BbStats::copy_threads_wait_ns};
+        BbCopy::WaitAsync();
+    }
 }
 
 void Scheduler::WaitHostCopies(u32 line, const char* function) {
@@ -378,8 +397,7 @@ void Scheduler::WaitHostCopies(u32 line, const char* function) {
                                             .count());
         BbStats::NoteHostCopyWait("HostCopy", function, line, ns);
     }
-    BbStats::WaitTimer timer{BbStats::copy_threads_wait_ns};
-    BbCopy::WaitAsync();
+    WaitCopyThreads();
 }
 
 void Scheduler::KickRecording(bool force) {

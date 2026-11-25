@@ -106,6 +106,8 @@ struct PipelineSelection {
     const AmdGpu::ComputeProgram* cs{};
     struct PrepWorker* worker{}; ///< set: read-only selection for a draw-preparation worker
     bool indirect_dispatch{}; ///< bbport: compute: workgroup count in GPU memory (WorkgroupSplit)
+    const GraphicsPipeline* prepared_pipeline{};
+    u64 prepared_pipeline_gen{};
 };
 
 /// bbport: a draw-preparation worker's own program state (see vk_draw_prep.h).
@@ -116,6 +118,8 @@ struct PrepWorker {
         Shader::HwStage hw_stage;
         VAddr pgm_base;
         const std::vector<u32>* flat;
+        u32 bininfo_byte_offset;
+        u32 first_word;
     };
     // Node-based: stages keep pointers to these Infos while later stages are inserted.
     std::unordered_map<const Program*, Shader::Info> infos;
@@ -152,7 +156,8 @@ public:
     }
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {},
-                                                const PreparedDraw* prepared = nullptr);
+                                                const PreparedDraw* prepared = nullptr,
+                                                bool skip_info_write = false);
 
     /// bbport: worker side of draw preparation: selects the pipeline key for `sel.regs` without
     /// creating anything. False when a program or permutation does not exist yet.
@@ -162,7 +167,8 @@ public:
 
     /// bbport: GPU-thread side: the pipeline for a prepared draw after checking that registers
     /// and flattened user data match; null to take the regular path.
-    const GraphicsPipeline* TryPreparedPipeline(const PreparedDraw& prepared);
+    const GraphicsPipeline* TryPreparedPipeline(const PreparedDraw& prepared,
+                                                bool skip_info_write = false);
 
     /// bbport: the prepared draw the last GetGraphicsPipeline used, or null (regular path).
     [[nodiscard]] const PreparedDraw* UsedPrepared() const noexcept {
@@ -195,6 +201,7 @@ private:
     bool RefreshGraphicsKey(PipelineSelection& sel);
     bool RefreshGraphicsStages(PipelineSelection& sel);
     bool RefreshComputeKey();
+    const ComputePipeline* TryFastComputePipeline(bool indirect);
 
     void WarmUpThread();
     void EnsureWarm() {
@@ -258,6 +265,7 @@ private:
     const PreparedDraw* used_prepared = nullptr;
     /// bbport: guards graphics_pipelines (draw-preparation workers insert into it).
     Common::SharedFirstMutex pipelines_mutex;
+    std::atomic<u64> pipelines_generation{1};
     static constexpr u64 PipelineClaimTag = 0x9E3779B97F4A7C15ull;
     std::mutex claim_mutex;
     std::condition_variable claim_cv;
@@ -267,6 +275,20 @@ private:
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     PipelineSelection sel{}; ///< GPU thread selection state
     ComputePipelineKey compute_key{};
+    struct ComputeFastEntry {
+        VAddr pgm_base = 0;
+        u32 first_word = 0;
+        u32 bininfo_byte_offset = 0;
+        u64 shader_hash = 0;
+        u64 pipelines_gen = 0;
+        Program* program = nullptr;
+        const ComputePipeline* pipeline = nullptr;
+        Shader::RuntimeInfo runtime_info{};
+        Shader::StageSpecialization spec{};
+    };
+    std::array<ComputeFastEntry, 64> compute_fast_cache{};
+    Program* last_cs_program = nullptr;
+    size_t last_cs_perm_idx = 0;
     std::atomic<u32> num_new_pipelines{}; // new pipelines added to the cache since the game start
 
     // bbport: preload on background threads and the driver's pipeline cache on disk.
